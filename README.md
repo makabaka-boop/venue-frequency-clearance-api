@@ -14,6 +14,7 @@
 | 用途 `purpose` | `handheld` / `bodypack` / `ifb`，两侧保护间隔固定为 **125 / 175 / 250 kHz** |
 | 带宽 `bandwidth_khz` | 25 至 400 的正整数（kHz）；MHz 模式下经定点换算后仍须落在该范围 |
 | 中心频率 `center_khz` | 整数（kHz）；MHz 模式下为最多三位小数的 MHz 数字 |
+| 数值类型 | 各数值字段（`center_khz` / `bandwidth_khz` 及试算调谐的 `candidate_centers_khz`）必须是 JSON 数字；带引号的字符串数字（如 `"500000"`）按类型错误 400 拒绝，定位到对应字段 |
 | 频率单位 `frequency_unit` | 顶层可选；省略或 `"mhz"`。省略时 `center_khz` / `bandwidth_khz` 只接受整数 kHz；`"mhz"` 时接受最多三位小数的 MHz JSON 数字，HTTP 层按**十进制定点**精确换算成整数 kHz（`0.201 → 201`），再交给既有区间裁决与净空计算，响应一律仍输出 kHz |
 | 占用区间 | `[center − floor(bw/2), center + ceil(bw/2)]`（闭区间） |
 | 保护区间 | 占用区间向两侧各扩展该用途的保护间隔 |
@@ -113,6 +114,7 @@ MHz 模式下下列情况返回定位到设备属性的 400（与其他设备级
 | `target_id` 缺失、不是字符串、为空或不存在于设备清单 | `target_id` |
 | 候选数组缺失、为空或超过 50 个 | `candidate_centers_khz` |
 | 候选数值精度非法（kHz 非整数、MHz 超三位小数、指数记法）或换算超出 int64 | `candidate_centers_khz[i]` |
+| 候选为字符串形式的数字（如 `"499000"`，非 JSON 数字） | `candidate_centers_khz[i]` |
 | 候选归一化（换算成 kHz）后重复（如 MHz 下 `500` 与 `500.000`） | `candidate_centers_khz[j]`（后一次出现） |
 | 同一对象内重复键（两个 `target_id`、两份候选数组等） | 重复字段本身 |
 
@@ -385,7 +387,7 @@ $ docker compose up --build api                 # 默认宿主端口 8080
 $ API_PORT=9000 docker compose up --build api   # API_PORT 覆盖宿主端口
 ```
 
-一次性验收服务 `verify`：等待 API 就绪后执行 26 组端到端检查并逐条打印 PASS/FAIL，
+一次性验收服务 `verify`：等待 API 就绪后执行 27 组端到端检查并逐条打印 PASS/FAIL，
 任一失败则以非零码退出：
 
 ```console

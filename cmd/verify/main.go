@@ -56,6 +56,7 @@ func main() {
 		{"retunes: out-of-band candidate is a trial verdict, not a 400", checkRetunesOutOfBandCandidate},
 		{"retunes: MHz candidates match kHz trials byte-for-byte", checkRetunesMHzMatchesKHz},
 		{"retunes: bad target, empty/duplicate/imprecise candidates are locatable 400s", checkRetunesValidationErrors},
+		{"string-typed numbers are locatable 400s, never trial input", checkStringTypedNumbers},
 	}
 
 	failures := 0
@@ -1175,6 +1176,88 @@ func checkRetunesValidationErrors(base string) error {
 }
 
 // --- helpers ---
+
+// checkStringTypedNumbers pins the numeric type contract: a quoted number
+// such as "500000" is not a JSON number and must never reach the interval
+// arithmetic or a retune trial — each is a 400 located at the exact field.
+func checkStringTypedNumbers(base string) error {
+	coordinateCases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{
+			name:  "string device center",
+			body:  `{"devices":[{"id":"a","purpose":"handheld","center_khz":"500000","bandwidth_khz":200}]}`,
+			field: "devices[0].center_khz",
+		},
+		{
+			name:  "string device bandwidth",
+			body:  `{"devices":[{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":"200"}]}`,
+			field: "devices[0].bandwidth_khz",
+		},
+		{
+			name:  "string center in mhz mode",
+			body:  `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":"500.000","bandwidth_khz":0.2}]}`,
+			field: "devices[0].center_khz",
+		},
+	}
+	for _, tc := range coordinateCases {
+		status, raw, err := postRaw(base, tc.body)
+		if err != nil {
+			return err
+		}
+		if err := expectFieldError(status, raw, tc.name, tc.field); err != nil {
+			return err
+		}
+	}
+	retuneCases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{
+			name:  "string candidate",
+			body:  `{"devices":[{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}],"target_id":"target","candidate_centers_khz":["499000"]}`,
+			field: "candidate_centers_khz[0]",
+		},
+		{
+			name:  "string candidate among numbers",
+			body:  `{"devices":[{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}],"target_id":"target","candidate_centers_khz":[499000,"500000"]}`,
+			field: "candidate_centers_khz[1]",
+		},
+	}
+	for _, tc := range retuneCases {
+		status, raw, err := postRetunes(base, tc.body)
+		if err != nil {
+			return err
+		}
+		if err := expectFieldError(status, raw, tc.name, tc.field); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// expectFieldError wants a 400 whose error list locates field.
+func expectFieldError(status int, raw []byte, name, field string) error {
+	if status != http.StatusBadRequest {
+		return fmt.Errorf("%s: status = %d, want 400, body = %s", name, status, raw)
+	}
+	var e errorResp
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return fmt.Errorf("%s: %w, body = %s", name, err, raw)
+	}
+	if e.Accepted {
+		return fmt.Errorf("%s: accepted = true, want false, body = %s", name, raw)
+	}
+	for _, fe := range e.Errors {
+		if fe.Field == field {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s: no error locating %q, body = %s", name, field, raw)
+}
 
 func checkDuplicateKeys(base string) error {
 	// Duplicated JSON object keys must not be silently last-wins: a request

@@ -18,13 +18,43 @@ import (
 // maxBodyBytes caps the request body; 1 MiB is far more than 200 devices need.
 const maxBodyBytes = 1 << 20
 
-// deviceInput is the wire form of one device. Numbers decode as json.Number
-// so non-integer values can be reported against the exact field.
+// deviceInput is the wire form of one device. Numbers decode as numberInput
+// so non-integer values — and string-typed numbers — can be reported against
+// the exact field.
 type deviceInput struct {
 	ID           string      `json:"id"`
 	Purpose      string      `json:"purpose"`
-	CenterKHz    json.Number `json:"center_khz"`
-	BandwidthKHz json.Number `json:"bandwidth_khz"`
+	CenterKHz    numberInput `json:"center_khz"`
+	BandwidthKHz numberInput `json:"bandwidth_khz"`
+}
+
+// numberInput is the wire form of one frequency or bandwidth number. It
+// records whether the JSON value arrived as a quoted string: encoding/json
+// silently accepts "500000" into a json.Number, but the contract requires an
+// actual JSON number, so validation rejects string-typed values against the
+// exact field instead of letting them into the interval arithmetic.
+type numberInput struct {
+	json.Number
+	quoted bool
+}
+
+// UnmarshalJSON records the number literal, flagging quoted strings so
+// validation can reject them as type errors. A missing or null value stays
+// empty and is reported by the required-field check, exactly as before.
+func (n *numberInput) UnmarshalJSON(b []byte) error {
+	n.Number, n.quoted = "", false
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		n.Number, n.quoted = json.Number(s), true
+		return nil
+	}
+	if string(b) != "null" {
+		n.Number = json.Number(b)
+	}
+	return nil
 }
 
 type coordinateRequest struct {
@@ -44,7 +74,7 @@ type checkRetunesRequest struct {
 	// TargetID stays raw so a non-string value can be reported against the
 	// field instead of failing the whole decode.
 	TargetID            json.RawMessage `json:"target_id"`
-	CandidateCentersKHz []json.Number   `json:"candidate_centers_khz"`
+	CandidateCentersKHz []numberInput   `json:"candidate_centers_khz"`
 	// FrequencyUnit behaves exactly as in coordinateRequest.
 	FrequencyUnit json.RawMessage `json:"frequency_unit"`
 }
@@ -285,7 +315,7 @@ func targetIDProblem(raw json.RawMessage) fieldError {
 // candidate to integer kHz exactly like a device center_khz. Candidates that
 // normalize to the same kHz value are ambiguous — the trial would run twice
 // on identical input — and are rejected against the later occurrence.
-func validateCandidates(inputs []json.Number, mhzMode bool) ([]int64, []fieldError) {
+func validateCandidates(inputs []numberInput, mhzMode bool) ([]int64, []fieldError) {
 	var errs []fieldError
 
 	switch {
@@ -457,9 +487,10 @@ func parseIncludeClearance(raw json.RawMessage) (value, ok bool) {
 // parseFrequency converts a JSON number to an integer kHz value. When mhz is
 // true the number is interpreted as MHz with up to three decimal places and
 // converted by decimal fixed-point arithmetic (value * 1000); otherwise only
-// an integer number of kHz is accepted.
-func parseFrequency(n json.Number, mhz bool) (int64, bool) {
-	if n.String() == "" {
+// an integer number of kHz is accepted. A string-typed value is never
+// accepted, whatever the unit: the field requires a JSON number.
+func parseFrequency(n numberInput, mhz bool) (int64, bool) {
+	if n.quoted || n.String() == "" {
 		return 0, false
 	}
 	if mhz {
@@ -473,11 +504,24 @@ func parseFrequency(n json.Number, mhz bool) (int64, bool) {
 	return v, true
 }
 
-func frequencyProblem(n json.Number, mhz bool) string {
+func frequencyProblem(n numberInput, mhz bool) string {
+	if n.quoted {
+		return quotedNumberProblem(n.String(), mhz)
+	}
 	if mhz {
 		return mhzProblem(n.String(), parseMHzProblem(n.String()))
 	}
-	return kHzProblem(n)
+	return kHzProblem(n.Number)
+}
+
+// quotedNumberProblem reports a string-typed number such as "500000" where
+// the contract requires a JSON number. The got-value keeps its quotes so the
+// type mistake stays visible in the message.
+func quotedNumberProblem(s string, mhz bool) string {
+	if mhz {
+		return fmt.Sprintf("must be a MHz number with at most three decimal places converting to an integer kHz, got %q", s)
+	}
+	return fmt.Sprintf("must be an integer number of kHz, got %q", s)
 }
 
 func kHzProblem(n json.Number) string {

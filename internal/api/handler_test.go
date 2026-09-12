@@ -523,6 +523,75 @@ func TestCoordinateIncludeClearanceTypeError(t *testing.T) {
 	}
 }
 
+// A string-typed number is a type error located at the exact field: a quoted
+// integer such as "500000" must not silently enter the interval arithmetic,
+// in either unit mode.
+func TestCoordinateStringTypedNumbersRejected(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		field       string
+		wantMessage string
+	}{
+		{
+			name:        "string center in kHz mode",
+			body:        `{"devices":[{"id":"a","purpose":"handheld","center_khz":"500000","bandwidth_khz":200}]}`,
+			field:       "devices[0].center_khz",
+			wantMessage: `must be an integer number of kHz, got "500000"`,
+		},
+		{
+			name:        "string bandwidth in kHz mode",
+			body:        `{"devices":[{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":"200"}]}`,
+			field:       "devices[0].bandwidth_khz",
+			wantMessage: `must be an integer number of kHz, got "200"`,
+		},
+		{
+			name:        "string center in MHz mode",
+			body:        `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":"500.000","bandwidth_khz":0.2}]}`,
+			field:       "devices[0].center_khz",
+			wantMessage: `must be a MHz number with at most three decimal places converting to an integer kHz, got "500.000"`,
+		},
+		{
+			name:        "string bandwidth in MHz mode",
+			body:        `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":500,"bandwidth_khz":"0.2"}]}`,
+			field:       "devices[0].bandwidth_khz",
+			wantMessage: `must be a MHz number with at most three decimal places converting to an integer kHz, got "0.2"`,
+		},
+		{
+			name:  "non-numeric string center",
+			body:  `{"devices":[{"id":"a","purpose":"handheld","center_khz":"abc","bandwidth_khz":200}]}`,
+			field: "devices[0].center_khz",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, resp := postBody(t, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+			}
+			if resp["accepted"] != false {
+				t.Errorf("accepted = %v; want false", resp["accepted"])
+			}
+			errs, ok := resp["errors"].([]any)
+			if !ok || len(errs) == 0 {
+				t.Fatalf("errors = %v; want a non-empty list", resp["errors"])
+			}
+			var matched map[string]any
+			for _, e := range errs {
+				if fe := e.(map[string]any); fe["field"] == tc.field {
+					matched = fe
+				}
+			}
+			if matched == nil {
+				t.Fatalf("missing error for %q; got %v", tc.field, resp["errors"])
+			}
+			if tc.wantMessage != "" && matched["message"] != tc.wantMessage {
+				t.Errorf("message = %q; want %q", matched["message"], tc.wantMessage)
+			}
+		})
+	}
+}
+
 // --- frequency_unit: mhz ---
 
 // MHz numbers with up to three decimal places are converted exactly to
@@ -1014,6 +1083,51 @@ func TestCheckRetunesValidationErrorsLocateFields(t *testing.T) {
 		if !got[want] {
 			t.Errorf("mixed errors: missing error for %q; got fields %v", want, got)
 		}
+	}
+}
+
+// A string-typed candidate is a locatable 400, not a trial: the quoted
+// integer must be rejected against its own index, in either unit mode, and
+// no trial runs on it.
+func TestCheckRetunesStringCandidateRejected(t *testing.T) {
+	fleet := `[{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]`
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"single string candidate", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":["499000"]}`, "candidate_centers_khz[0]"},
+		{"string candidate among numbers", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[499000,"500000"]}`, "candidate_centers_khz[1]"},
+		{"mhz string candidate", `{"frequency_unit":"mhz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":["499.000"]}`, "candidate_centers_khz[0]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, resp := postRetunes(t, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+			}
+			if resp["accepted"] != false {
+				t.Errorf("accepted = %v; want false", resp["accepted"])
+			}
+			errs, ok := resp["errors"].([]any)
+			if !ok || len(errs) == 0 {
+				t.Fatalf("errors = %v; want a non-empty list", resp["errors"])
+			}
+			got := make(map[string]bool, len(errs))
+			for _, e := range errs {
+				got[e.(map[string]any)["field"].(string)] = true
+			}
+			if !got[tc.field] {
+				t.Errorf("missing error for field %q; got fields %v", tc.field, got)
+			}
+		})
+	}
+
+	// The exact message keeps the quotes so the type mistake stays visible.
+	status, raw := postRetunesRaw(t, `{"devices":`+fleet+`,"target_id":"target","candidate_centers_khz":["499000"]}`)
+	want := `{"accepted":false,"errors":[{"field":"candidate_centers_khz[0]","message":"must be an integer number of kHz, got \"499000\""}]}`
+	if status != http.StatusBadRequest || string(raw) != want {
+		t.Errorf("status = %d, body = %s; want 400 %s", status, raw, want)
 	}
 }
 
