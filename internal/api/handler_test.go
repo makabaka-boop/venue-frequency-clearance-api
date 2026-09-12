@@ -521,3 +521,296 @@ func TestCoordinateIncludeClearanceTypeError(t *testing.T) {
 		}
 	}
 }
+
+// --- frequency_unit: mhz ---
+
+// MHz numbers with up to three decimal places are converted exactly to
+// integer kHz at the HTTP layer, then adjudicated by the unchanged rules.
+// Odd bandwidths in MHz keep the asymmetric occupied interval:
+// mic-b 600 MHz / 0.201 MHz -> 600000 / 201 -> [599650, 600351];
+// mic-a 500 MHz / 0.2 MHz   -> 500000 / 200 -> [499775, 500225].
+func TestCoordinateMHzAcceptedOddBandwidth(t *testing.T) {
+	body := `{"frequency_unit":"mhz","devices":[
+		{"id":"mic-b","purpose":"ifb","center_khz":600,"bandwidth_khz":0.201},
+		{"id":"mic-a","purpose":"handheld","center_khz":500.000,"bandwidth_khz":0.2}
+	]}`
+	status, raw := postBodyRaw(t, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d; want 200, body = %s", status, raw)
+	}
+	wantBody := `{"accepted":true,"devices":[{"id":"mic-a","low_khz":499775,"high_khz":500225},{"id":"mic-b","low_khz":599650,"high_khz":600351}]}`
+	if string(raw) != wantBody {
+		t.Errorf("body = %s; want %s", raw, wantBody)
+	}
+
+	// The kHz-equivalent request must produce byte-identical output: the
+	// conversion happens before adjudication and adds no response branch.
+	kHzBody := `{"devices":[
+		{"id":"mic-b","purpose":"ifb","center_khz":600000,"bandwidth_khz":201},
+		{"id":"mic-a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+	]}`
+	_, kHzRaw := postBodyRaw(t, kHzBody)
+	if !bytes.Equal(raw, kHzRaw) {
+		t.Errorf("MHz and kHz responses differ:\n%s\n%s", raw, kHzRaw)
+	}
+}
+
+// Two devices whose protected intervals touch at one endpoint conflict in
+// MHz mode exactly as they do in kHz mode: handheld, 0.2 MHz bw -> ±0.225 MHz,
+// centers 500.000 and 500.450 MHz meet at 500.225 MHz; 500.451 is accepted.
+func TestCoordinateMHzTouchingEndpoints(t *testing.T) {
+	touch := `{"frequency_unit":"mhz","devices":[
+		{"id":"b","purpose":"handheld","center_khz":500.450,"bandwidth_khz":0.200},
+		{"id":"a","purpose":"handheld","center_khz":500.000,"bandwidth_khz":0.200}
+	]}`
+	status, raw := postBodyRaw(t, touch)
+	if status != http.StatusOK {
+		t.Fatalf("touch: status = %d; want 200, body = %s", status, raw)
+	}
+	wantBody := `{"accepted":false,"conflicts":[{"first":"a","second":"b"}],"out_of_band":[]}`
+	if string(raw) != wantBody {
+		t.Errorf("touch: body = %s; want %s", raw, wantBody)
+	}
+
+	apart := `{"frequency_unit":"mhz","devices":[
+		{"id":"b","purpose":"handheld","center_khz":500.451,"bandwidth_khz":0.200},
+		{"id":"a","purpose":"handheld","center_khz":500.000,"bandwidth_khz":0.200}
+	]}`
+	status, raw = postBodyRaw(t, apart)
+	if status != http.StatusOK {
+		t.Fatalf("apart: status = %d; want 200, body = %s", status, raw)
+	}
+	var resp struct {
+		Accepted  bool  `json:"accepted"`
+		Conflicts []any `json:"conflicts"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Accepted || len(resp.Conflicts) != 0 {
+		t.Errorf("apart: accepted=%v conflicts=%v, want accepted with no conflicts", resp.Accepted, resp.Conflicts)
+	}
+}
+
+// Clearance is computed after the kHz conversion and its limiter sources are
+// unchanged: the MHz response, including the clearance block, must be
+// byte-identical to the kHz request for the same fleet.
+func TestCoordinateMHzClearanceMatchesKHz(t *testing.T) {
+	mhzBody := `{
+		"frequency_unit": "mhz",
+		"include_clearance": true,
+		"devices": [
+			{"id":"mic-c","purpose":"ifb","center_khz":600,"bandwidth_khz":0.201},
+			{"id":"mic-a","purpose":"handheld","center_khz":500,"bandwidth_khz":0.2},
+			{"id":"mic-b","purpose":"handheld","center_khz":500.5,"bandwidth_khz":0.2}
+		]
+	}`
+	khzBody := `{
+		"include_clearance": true,
+		"devices": [
+			{"id":"mic-c","purpose":"ifb","center_khz":600000,"bandwidth_khz":201},
+			{"id":"mic-a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+			{"id":"mic-b","purpose":"handheld","center_khz":500500,"bandwidth_khz":200}
+		]
+	}`
+	_, mhzRaw := postBodyRaw(t, mhzBody)
+	_, khzRaw := postBodyRaw(t, khzBody)
+	if !bytes.Equal(mhzRaw, khzRaw) {
+		t.Errorf("MHz clearance response differs from kHz:\n%s\n%s", mhzRaw, khzRaw)
+	}
+	wantBody := `{"accepted":true,"clearance":{"minimum_khz":49,"devices":[{"id":"mic-a","minimum_khz":49,"limiter":"mic-b"},{"id":"mic-b","minimum_khz":49,"limiter":"mic-a"},{"id":"mic-c","minimum_khz":93649,"limiter":"band_high"}]},"devices":[{"id":"mic-a","low_khz":499775,"high_khz":500225},{"id":"mic-b","low_khz":500275,"high_khz":500725},{"id":"mic-c","low_khz":599650,"high_khz":600351}]}`
+	if string(mhzRaw) != wantBody {
+		t.Errorf("body = %s; want %s", mhzRaw, wantBody)
+	}
+}
+
+// MHz precision, conversion and range failures are 400s located at the
+// offending device property; the existing kHz bandwidth range still applies
+// after exact conversion.
+func TestCoordinateMHzValidationErrorsLocateFields(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		field       string
+		wantMessage string // empty: only check field/status
+	}{
+		{
+			name:        "center with four decimal places",
+			body:        `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":500.0001,"bandwidth_khz":0.2}]}`,
+			field:       "devices[0].center_khz",
+			wantMessage: `must be a MHz number with at most three decimal places converting to an integer kHz, got 500.0001`,
+		},
+		{
+			name:        "bandwidth with four decimal places",
+			body:        `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":500,"bandwidth_khz":0.2005}]}`,
+			field:       "devices[0].bandwidth_khz",
+			wantMessage: `must be a MHz number with at most three decimal places converting to an integer kHz, got 0.2005`,
+		},
+		{
+			name:  "exponent notation is not fixed point",
+			body:  `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":5e2,"bandwidth_khz":0.2}]}`,
+			field: "devices[0].center_khz",
+		},
+		{
+			name:  "converted positive center beyond int64 kHz",
+			body:  `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":9223372036854775.808,"bandwidth_khz":0.2}]}`,
+			field: "devices[0].center_khz",
+		},
+		{
+			name:  "converted negative center beyond int64 kHz",
+			body:  `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":-9223372036854775.809,"bandwidth_khz":0.2}]}`,
+			field: "devices[0].center_khz",
+		},
+		{
+			name:        "converted bandwidth below 25 kHz",
+			body:        `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":500,"bandwidth_khz":0.024}]}`,
+			field:       "devices[0].bandwidth_khz",
+			wantMessage: `must be between 25 and 400 kHz, got 24`,
+		},
+		{
+			name:        "converted bandwidth above 400 kHz",
+			body:        `{"frequency_unit":"mhz","devices":[{"id":"a","purpose":"handheld","center_khz":500,"bandwidth_khz":0.401}]}`,
+			field:       "devices[0].bandwidth_khz",
+			wantMessage: `must be between 25 and 400 kHz, got 401`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, resp := postBody(t, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+			}
+			errs, ok := resp["errors"].([]any)
+			if !ok || len(errs) == 0 {
+				t.Fatalf("errors = %v; want a non-empty list", resp["errors"])
+			}
+			var matched any
+			for _, e := range errs {
+				fe := e.(map[string]any)
+				if fe["field"] == tc.field {
+					matched = fe
+				}
+			}
+			if matched == nil {
+				got := make([]string, 0, len(errs))
+				for _, e := range errs {
+					got = append(got, e.(map[string]any)["field"].(string))
+				}
+				t.Fatalf("missing error for %q; got fields %v", tc.field, got)
+			}
+			if tc.wantMessage != "" && matched.(map[string]any)["message"] != tc.wantMessage {
+				t.Errorf("message = %q; want %q", matched.(map[string]any)["message"], tc.wantMessage)
+			}
+		})
+	}
+}
+
+// Boundary values of the fixed-point conversion itself.
+func TestParseMHzToKHz(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   int64
+		reason string
+	}{
+		{"500", 500000, mhzOK},
+		{"500.", 0, mhzBadPrecision}, // JSON never emits this; reject defensively
+		{".5", 0, mhzBadPrecision},   // same
+		{"500.0", 500000, mhzOK},
+		{"0.025", 25, mhzOK},  // minimum legal bandwidth after conversion
+		{"0.201", 201, mhzOK}, // odd kHz
+		{"-0.001", -1, mhzOK},
+		{"-500.450", -500450, mhzOK},
+		{"500.0001", 0, mhzBadPrecision},
+		{"-9223372036854.775808", 0, mhzBadPrecision}, // MinInt64 kHz would need six decimals
+		{"500.00a", 0, mhzBadPrecision},
+		{"5e2", 0, mhzBadPrecision},
+		{"1e3", 0, mhzBadPrecision},
+		{"9223372036854.775", 9223372036854775, mhzOK},       // inside int64 kHz
+		{"9223372036854.776", 9223372036854776, mhzOK},       // inside int64 kHz
+		{"9223372036854775.807", 9223372036854775807, mhzOK}, // exactly MaxInt64 kHz
+		{"9223372036854775.808", 0, mhzOutOfIntRange},        // MaxInt64 + 1 kHz
+		{"-9223372036854.776", -9223372036854776, mhzOK},
+		{"-9223372036854775.808", -9223372036854775808, mhzOK}, // exactly MinInt64 kHz
+		{"-9223372036854775.809", 0, mhzOutOfIntRange},         // MinInt64 - 1 kHz
+		{"99999999999999", 99999999999999000, mhzOK},           // 17-digit kHz value, inside int64
+		{"9999999999999999", 0, mhzOutOfIntRange},              // 19-digit kHz value, outside int64
+		{"", 0, mhzMissing},
+	}
+	for _, tc := range cases {
+		got, reason := parseMHzToKHz(tc.in)
+		if reason != tc.reason || (reason == mhzOK && got != tc.want) {
+			t.Errorf("parseMHzToKHz(%q) = (%d, %q); want (%d, %q)", tc.in, got, reason, tc.want, tc.reason)
+		}
+	}
+}
+
+// Unknown or mistyped frequency_unit values are refused before adjudication;
+// the failure is located at the top-level field, and device-level problems in
+// the same body are still reported.
+func TestCoordinateFrequencyUnitErrors(t *testing.T) {
+	for _, value := range []string{`"khz"`, `"GHz"`, `"MHz"`, `"hertz"`, `null`, `1`, `true`, `{}`} {
+		body := `{"frequency_unit":` + value + `,"devices":[{"id":"x","purpose":"lavalier","center_khz":500000,"bandwidth_khz":200}]}`
+		status, resp := postBody(t, body)
+		if status != http.StatusBadRequest {
+			t.Fatalf("frequency_unit=%s: status = %d; want 400, resp = %v", value, status, resp)
+		}
+		errs, ok := resp["errors"].([]any)
+		if !ok {
+			t.Fatalf("frequency_unit=%s: errors = %v; want a list", value, resp["errors"])
+		}
+		got := make(map[string]bool, len(errs))
+		for _, e := range errs {
+			got[e.(map[string]any)["field"].(string)] = true
+		}
+		if !got["frequency_unit"] {
+			t.Errorf("frequency_unit=%s: missing error for the unit itself; got fields %v", value, got)
+		}
+		if !got["devices[0].purpose"] {
+			t.Errorf("frequency_unit=%s: device-level error dropped; got fields %v", value, got)
+		}
+	}
+}
+
+// A duplicated frequency_unit is an ambiguous object key and is rejected by
+// the duplicate-key scan before adjudication, even when both values agree.
+func TestCoordinateDuplicateFrequencyUnit(t *testing.T) {
+	body := `{
+		"frequency_unit": "mhz",
+		"frequency_unit": "mhz",
+		"devices": [{"id":"a","purpose":"handheld","center_khz":500,"bandwidth_khz":0.2}]
+	}`
+	status, resp := postBody(t, body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+	}
+	errs, ok := resp["errors"].([]any)
+	if !ok || len(errs) != 1 {
+		t.Fatalf("errors = %v; want exactly one entry", resp["errors"])
+	}
+	if errs[0].(map[string]any)["field"] != "frequency_unit" {
+		t.Errorf("field = %v; want frequency_unit", errs[0])
+	}
+}
+
+// Without frequency_unit the legacy contract is byte-for-byte intact, both
+// for successes (accepted/rejected) and for the 400 rejecting a fractional
+// kHz number.
+func TestCoordinateLegacyKHzBytesUnchanged(t *testing.T) {
+	accepted := `{"devices":[{"id":"solo","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]}`
+	status, raw := postBodyRaw(t, accepted)
+	if status != http.StatusOK || string(raw) != `{"accepted":true,"devices":[{"id":"solo","low_khz":499775,"high_khz":500225}]}` {
+		t.Errorf("accepted legacy body changed: %d %s", status, raw)
+	}
+
+	rejected := `{"devices":[{"id":"b","purpose":"handheld","center_khz":500450,"bandwidth_khz":200},{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]}`
+	status, raw = postBodyRaw(t, rejected)
+	if status != http.StatusOK || string(raw) != `{"accepted":false,"conflicts":[{"first":"a","second":"b"}],"out_of_band":[]}` {
+		t.Errorf("rejected legacy body changed: %d %s", status, raw)
+	}
+
+	bad := `{"devices":[{"id":"w","purpose":"handheld","center_khz":500000.5,"bandwidth_khz":200}]}`
+	status, raw = postBodyRaw(t, bad)
+	if status != http.StatusBadRequest || string(raw) != `{"accepted":false,"errors":[{"field":"devices[0].center_khz","message":"must be an integer number of kHz, got 500000.5"}]}` {
+		t.Errorf("legacy 400 body changed: %d %s", status, raw)
+	}
+}

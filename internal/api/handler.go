@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -31,7 +32,15 @@ type coordinateRequest struct {
 	// IncludeClearance stays raw so a non-boolean value can be reported
 	// against the field instead of failing the whole decode.
 	IncludeClearance json.RawMessage `json:"include_clearance"`
+	// FrequencyUnit stays raw so a non-string or unknown value can be
+	// reported against the field instead of failing the whole decode.
+	FrequencyUnit json.RawMessage `json:"frequency_unit"`
 }
+
+// FrequencyUnitMHz is the only accepted frequency_unit value. With it set,
+// center_khz / bandwidth_khz carry MHz numbers with up to three decimal
+// places, which the HTTP layer converts to integer kHz before adjudication.
+const FrequencyUnitMHz = "mhz"
 
 // fieldError locates one validation problem, e.g. "devices[2].bandwidth_khz".
 type fieldError struct {
@@ -152,6 +161,19 @@ func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError)
 		})
 	}
 
+	// frequency_unit is a top-level input-shape choice: anything other than
+	// absent or "mhz" (an explicit "khz", unknown units, null or another
+	// type) is rejected before adjudication. With an invalid unit the device
+	// numbers keep their legacy kHz parsing, so spurious precision errors do
+	// not mask the actual unit mistake.
+	inMHz, unitOK := parseFrequencyUnit(req.FrequencyUnit)
+	if !unitOK {
+		errs = append(errs, fieldError{
+			Field:   "frequency_unit",
+			Message: fmt.Sprintf(`must be omitted or %q, got %s`, FrequencyUnitMHz, string(req.FrequencyUnit)),
+		})
+	}
+
 	switch {
 	case req.Devices == nil:
 		errs = append(errs, fieldError{Field: "devices", Message: "is required"})
@@ -186,14 +208,17 @@ func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError)
 			})
 		}
 
-		center, ok := parseKHz(in.CenterKHz)
-		if !ok {
-			errs = append(errs, fieldError{Field: prefix + ".center_khz", Message: kHzProblem(in.CenterKHz)})
+		center, centerOK := parseFrequency(in.CenterKHz, inMHz && unitOK)
+		if !centerOK {
+			errs = append(errs, fieldError{Field: prefix + ".center_khz", Message: frequencyProblem(in.CenterKHz, inMHz && unitOK)})
 		}
 
-		bw, ok := parseKHz(in.BandwidthKHz)
-		if !ok {
-			errs = append(errs, fieldError{Field: prefix + ".bandwidth_khz", Message: kHzProblem(in.BandwidthKHz)})
+		// The bandwidth range check is unchanged across units: the MHz value
+		// is converted to integer kHz first, then the existing 25..400 kHz
+		// range applies, with no unit-specific branch.
+		bw, bwOK := parseFrequency(in.BandwidthKHz, inMHz && unitOK)
+		if !bwOK {
+			errs = append(errs, fieldError{Field: prefix + ".bandwidth_khz", Message: frequencyProblem(in.BandwidthKHz, inMHz && unitOK)})
 		} else if bw < rules.MinBandwidthKHz || bw > rules.MaxBandwidthKHz {
 			errs = append(errs, fieldError{
 				Field:   prefix + ".bandwidth_khz",
@@ -209,6 +234,24 @@ func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError)
 		})
 	}
 	return devices, includeClearance, errs
+}
+
+// parseFrequencyUnit reads the optional frequency_unit selector. Absent means
+// legacy integer-kHz mode; the only accepted value is the JSON string "mhz".
+// Anything else — null, numbers, objects or an unknown unit such as "khz" —
+// must be rejected before adjudication.
+func parseFrequencyUnit(raw json.RawMessage) (mhz bool, ok bool) {
+	if len(raw) == 0 {
+		return false, true
+	}
+	if string(raw) == "null" {
+		return false, false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return false, false
+	}
+	return s == FrequencyUnitMHz, s == FrequencyUnitMHz
 }
 
 // parseIncludeClearance reads the optional include_clearance switch. Absent
@@ -229,10 +272,17 @@ func parseIncludeClearance(raw json.RawMessage) (value, ok bool) {
 	return value, true
 }
 
-// parseKHz converts a JSON number to an integer kHz value.
-func parseKHz(n json.Number) (int64, bool) {
+// parseFrequency converts a JSON number to an integer kHz value. When mhz is
+// true the number is interpreted as MHz with up to three decimal places and
+// converted by decimal fixed-point arithmetic (value * 1000); otherwise only
+// an integer number of kHz is accepted.
+func parseFrequency(n json.Number, mhz bool) (int64, bool) {
 	if n.String() == "" {
 		return 0, false
+	}
+	if mhz {
+		v, reason := parseMHzToKHz(n.String())
+		return v, reason == mhzOK
 	}
 	v, err := n.Int64()
 	if err != nil {
@@ -241,11 +291,127 @@ func parseKHz(n json.Number) (int64, bool) {
 	return v, true
 }
 
+func frequencyProblem(n json.Number, mhz bool) string {
+	if mhz {
+		return mhzProblem(n.String(), parseMHzProblem(n.String()))
+	}
+	return kHzProblem(n)
+}
+
 func kHzProblem(n json.Number) string {
 	if n.String() == "" {
 		return "is required and must be an integer number of kHz"
 	}
 	return fmt.Sprintf("must be an integer number of kHz, got %s", n.String())
+}
+
+// MHz-to-kHz conversion failure reasons.
+const (
+	mhzOK            = ""
+	mhzMissing       = "missing"
+	mhzBadPrecision  = "precision"
+	mhzOutOfIntRange = "range"
+)
+
+// parseMHzProblem reports why a JSON number is not an accepted MHz value; it
+// returns mhzOK when the value converts to an integer kHz exactly.
+func parseMHzProblem(s string) string {
+	_, reason := parseMHzToKHz(s)
+	return reason
+}
+
+func mhzProblem(s, reason string) string {
+	switch reason {
+	case mhzMissing:
+		return "is required and must be a MHz number with at most three decimal places"
+	case mhzOutOfIntRange:
+		return fmt.Sprintf("must convert to an integer kHz inside the int64 range, got %s MHz", s)
+	default:
+		return fmt.Sprintf("must be a MHz number with at most three decimal places converting to an integer kHz, got %s", s)
+	}
+}
+
+// parseMHzToKHz converts a decimal fixed-point JSON number in MHz to an exact
+// integer kHz by multiplying by 1000, without going through a floating-point
+// value. Accepted grammar: an optional sign, one or more integer digits, an
+// optional decimal point followed by 1 to 3 digits. Exponent notation is not
+// accepted (its printed precision is ambiguous), and a value that would not
+// fit in int64 kHz is rejected. The JSON grammar excludes lone ".5" / "5.",
+// but they are rejected here as well rather than trusted.
+func parseMHzToKHz(s string) (int64, string) {
+	if s == "" {
+		return 0, mhzMissing
+	}
+	neg := false
+	switch s[0] {
+	case '-':
+		neg = true
+		s = s[1:]
+	case '+':
+		s = s[1:]
+	}
+	intPart, fracPart := s, ""
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		intPart, fracPart = s[:i], s[i+1:]
+		if strings.IndexByte(fracPart, '.') >= 0 {
+			return 0, mhzBadPrecision
+		}
+	}
+	if !allDigits(intPart) {
+		return 0, mhzBadPrecision
+	}
+	// A decimal point must carry fractional digits (JSON numbers never end
+	// with one). At most three fractional digits are allowed: kHz is the
+	// finest resolution, so a fourth decimal place would be a sub-kHz
+	// fraction with no integer conversion.
+	if strings.ContainsRune(s, '.') && !allDigits(fracPart) {
+		return 0, mhzBadPrecision
+	}
+	if len(fracPart) > 3 {
+		return 0, mhzBadPrecision
+	}
+
+	// kHz value as a sign-free digit string: integer MHz * 1000 plus the
+	// fractional MHz padded to three digits (0.201 MHz -> 201 kHz).
+	khzDigits := strings.TrimLeft(intPart+fracPart+strings.Repeat("0", 3-len(fracPart)), "0")
+	if khzDigits == "" {
+		return 0, mhzOK // ±0
+	}
+	limit := "9223372036854775808" // |math.MinInt64|, one above MaxInt64
+	tooLarge := len(khzDigits) > len(limit) ||
+		(len(khzDigits) == len(limit) && khzDigits > limit)
+	equalMin := khzDigits == limit
+	// MaxInt64 kHz is limit-1, so positive values may not reach limit;
+	// negative ones may equal it but not exceed it.
+	if tooLarge || (!neg && equalMin) {
+		return 0, mhzOutOfIntRange
+	}
+	if neg {
+		// Accumulate in the negative direction so -2^63 fits without an
+		// intermediate overflow.
+		var v int64
+		for _, d := range khzDigits {
+			v = v*10 - int64(d-'0')
+		}
+		return v, mhzOK
+	}
+	var v int64
+	for _, d := range khzDigits {
+		v = v*10 + int64(d-'0')
+	}
+	return v, mhzOK
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func writeErrors(c *gin.Context, status int, errs ...fieldError) {

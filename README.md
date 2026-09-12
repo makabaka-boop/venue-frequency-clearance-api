@@ -12,8 +12,9 @@
 | --- | --- |
 | 设备数量 | 1 至 200 台，`id` 为唯一非空字符串 |
 | 用途 `purpose` | `handheld` / `bodypack` / `ifb`，两侧保护间隔固定为 **125 / 175 / 250 kHz** |
-| 带宽 `bandwidth_khz` | 25 至 400 的正整数（kHz） |
-| 中心频率 `center_khz` | 整数（kHz） |
+| 带宽 `bandwidth_khz` | 25 至 400 的正整数（kHz）；MHz 模式下经定点换算后仍须落在该范围 |
+| 中心频率 `center_khz` | 整数（kHz）；MHz 模式下为最多三位小数的 MHz 数字 |
+| 频率单位 `frequency_unit` | 顶层可选；省略或 `"mhz"`。省略时 `center_khz` / `bandwidth_khz` 只接受整数 kHz；`"mhz"` 时接受最多三位小数的 MHz JSON 数字，HTTP 层按**十进制定点**精确换算成整数 kHz（`0.201 → 201`），再交给既有区间裁决与净空计算，响应一律仍输出 kHz |
 | 占用区间 | `[center − floor(bw/2), center + ceil(bw/2)]`（闭区间） |
 | 保护区间 | 占用区间向两侧各扩展该用途的保护间隔 |
 | 允许频段 | 闭区间 `[470000, 694000]` kHz，端点压线算在界内 |
@@ -64,18 +65,44 @@ JSON 标准允许对象内同名键重复出现，其语义未定义；编码库
 
 重复字段属请求结构错误，先于设备级校验报告；一份请求中的多个重复字段一次性全部列出。
 
+## MHz 直填（`frequency_unit`）
+
+场馆设备清单常按 MHz 小数登记中心频率与带宽（如 500.125 MHz、0.201 MHz）。协调员可在请求
+顶层带 `"frequency_unit": "mhz"`，直接提交原始数字，无需人工换算成 kHz：
+
+- `center_khz` / `bandwidth_khz` 接受**最多三位小数**的 JSON 数字（`500`、`500.0`、`0.201` 均可），
+  字段名仍为 `*_khz`，但数值按 MHz 解释。
+- HTTP 层用**十进制定点**算术乘 1000 精确换算为整数 kHz（如 `500.125 → 500125`、`0.201 → 201`），
+  全程不经过浮点，杜绝 `0.1 + 0.2` 式偏差。
+- 换算在进入领域规则前完成：之后的占用/保护区间、设备排序、冲突判定、净空及其 limiter 来源
+  **不另设 MHz 分支**，与提交等价整数 kHz 的请求**逐字节一致**；响应始终输出 kHz。
+- 省略 `frequency_unit` 时既有整数 kHz 契约完全不变，成功与拒绝响应逐字节保持原状。
+  取值只有"省略"与 `"mhz"` 两种合法形态：显式写 `"khz"` 或其他单位会被拒绝。
+
+MHz 模式下下列情况返回定位到设备属性的 400（与其他设备级错误一并报告）：
+
+| 问题 | 定位字段 |
+| --- | --- |
+| 小数位超过三位（如 `500.1234`） | `devices[i].center_khz` / `devices[i].bandwidth_khz` |
+| 指数记法（如 `5e2`，非十进制定点） | 同上 |
+| 换算结果超出 int64 kHz 范围 | 同上 |
+| 换算后的带宽不在既有 25–400 kHz 范围 | `devices[i].bandwidth_khz`（错误文案给出换算后的 kHz 整数） |
+
+`frequency_unit` 本身取值未知（`"ghz"`、大小写不符的 `"MHz"`、显式 `"khz"` 等）、类型错误
+（`null`、数字、布尔等），或在同一对象内重复出现时，在裁决前以定位 `frequency_unit` 的 400 拒绝。
 
 ## API
 
 ### `POST /v1/coordinate`
 
-请求体（`include_clearance` 可选，默认关闭）：
+请求体（`include_clearance`、`frequency_unit` 均可选，默认关闭 / 整数 kHz）：
 
 ```json
 {
   "include_clearance": true,
+  "frequency_unit": "mhz",
   "devices": [
-    {"id": "alpha", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200}
+    {"id": "alpha", "purpose": "handheld", "center_khz": 500.0, "bandwidth_khz": 0.2}
   ]
 }
 ```
@@ -86,7 +113,7 @@ JSON 标准允许对象内同名键重复出现，其语义未定义；编码库
 | --- | --- | --- |
 | 放行 | 200 | `{"accepted": true, "devices": [{"id","low_khz","high_khz"}, ...]}`；请求带 `include_clearance=true` 时追加 `"clearance": {"minimum_khz", "devices": [{"id","minimum_khz","limiter"}, ...]}` |
 | 越界 / 冲突 | 200 | `{"accepted": false, "out_of_band": [...], "conflicts": [{"first","second"}, ...]}`（即使请求了开关也不含 `clearance`） |
-| 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `devices[2].bandwidth_khz`、`include_clearance`；同一 JSON 对象内重复键（如两份 `devices`、两个 `include_clearance`、设备内两个 `center_khz`）同样 400，定位到重复字段 |
+| 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `devices[2].bandwidth_khz`、`include_clearance`、`frequency_unit`；同一 JSON 对象内重复键（如两份 `devices`、两个 `include_clearance`、设备内两个 `center_khz`、两个 `frequency_unit`）同样 400，定位到重复字段 |
 
 另提供 `GET /healthz` 用于健康检查。
 
@@ -235,6 +262,41 @@ $ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: applicat
 `"field":"devices"` 拒绝；单台设备给两个不同 `center_khz` 则以
 `"field":"devices[0].center_khz"` 拒绝，不按最后一个频率计算保护区间。
 
+### 10. MHz 直填与整数 kHz 等价（奇数带宽）
+
+`"frequency_unit":"mhz"` 下，`gamma` 的 600 MHz / 0.201 MHz 先定点换算为 600000 / 201 kHz
+（奇数带宽的非对称占用区间照常），`alpha` 的 500 MHz / 0.2 MHz 换算为 500000 / 200 kHz，
+随后的保护区间、排序与净空与示例 1、7 完全相同，响应仍以 kHz 输出：
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: application/json' -d '{
+  "frequency_unit": "mhz",
+  "include_clearance": true,
+  "devices": [
+    {"id": "gamma", "purpose": "ifb",      "center_khz": 600,    "bandwidth_khz": 0.201},
+    {"id": "alpha", "purpose": "handheld", "center_khz": 500.000, "bandwidth_khz": 0.200}
+  ]
+}'
+{"accepted":true,"clearance":{"minimum_khz":29775,"devices":[{"id":"alpha","minimum_khz":29775,"limiter":"band_low"},{"id":"gamma","minimum_khz":93649,"limiter":"band_high"}]},"devices":[{"id":"alpha","low_khz":499775,"high_khz":500225},{"id":"gamma","low_khz":599650,"high_khz":600351}]}
+```
+
+该响应与提交等价整数 kHz（不带 `frequency_unit`）的响应逐字节一致；MHz 模式下端点相触
+（500.000 与 500.450 MHz）同样判冲突。非法精度可定位到设备属性：
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: application/json' -d '{
+  "frequency_unit": "mhz",
+  "devices": [
+    {"id": "a", "purpose": "handheld", "center_khz": 500.1234, "bandwidth_khz": 0.2}
+  ]
+}'
+{"accepted":false,"errors":[{"field":"devices[0].center_khz","message":"must be a MHz number with at most three decimal places converting to an integer kHz, got 500.1234"}]}
+```
+
+`"frequency_unit":"khz"`、`"GHz"`、`null`、数字等未知或类型错误的取值，以及顶层重复的
+`frequency_unit`，都在裁决前以定位 `frequency_unit` 的 400 拒绝。不带 `frequency_unit` 时，
+整数 kHz 的既有成功与拒绝响应逐字节不变。
+
 ## 运行
 
 ### 本地（Go 1.25+）
@@ -251,7 +313,7 @@ $ docker compose up --build api                 # 默认宿主端口 8080
 $ API_PORT=9000 docker compose up --build api   # API_PORT 覆盖宿主端口
 ```
 
-一次性验收服务 `verify`：等待 API 就绪后执行 16 组端到端检查并逐条打印 PASS/FAIL，
+一次性验收服务 `verify`：等待 API 就绪后执行 21 组端到端检查并逐条打印 PASS/FAIL，
 任一失败则以非零码退出：
 
 ```console
