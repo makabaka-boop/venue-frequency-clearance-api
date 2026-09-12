@@ -395,6 +395,107 @@ func TestCoordinateClearanceOmittedOnRejection(t *testing.T) {
 	}
 }
 
+// Duplicated object keys must be rejected as a 400 naming the field:
+// encoding/json would otherwise keep the last value and adjudicate an
+// ambiguous request on it.
+func TestCoordinateDuplicateKeys(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{
+			name: "clearance switch both off and on",
+			body: `{
+				"include_clearance": false,
+				"include_clearance": true,
+				"devices": [{"id":"solo","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]
+			}`,
+			field: "include_clearance",
+		},
+		{
+			name: "two distinct device lists",
+			body: `{
+				"devices": [{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}],
+				"devices": [{"id":"b","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]
+			}`,
+			field: "devices",
+		},
+		{
+			name: "one device with two center frequencies",
+			body: `{"devices":[
+				{"id":"a","purpose":"handheld","center_khz":500000,"center_khz":500400,"bandwidth_khz":200}
+			]}`,
+			field: "devices[0].center_khz",
+		},
+		{
+			name: "duplicate key on the second device",
+			body: `{"devices":[
+				{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+				{"id":"b","purpose":"handheld","center_khz":500000,"bandwidth_khz":200,"bandwidth_khz":100}
+			]}`,
+			field: "devices[1].bandwidth_khz",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, resp := postBody(t, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+			}
+			if resp["accepted"] != false {
+				t.Errorf("accepted = %v; want false", resp["accepted"])
+			}
+			errs, ok := resp["errors"].([]any)
+			if !ok || len(errs) == 0 {
+				t.Fatalf("errors = %v; want a non-empty list", resp["errors"])
+			}
+			got := make(map[string]bool, len(errs))
+			for _, e := range errs {
+				got[e.(map[string]any)["field"].(string)] = true
+			}
+			if !got[tc.field] {
+				t.Errorf("missing error for field %q; got fields %v", tc.field, got)
+			}
+		})
+	}
+}
+
+// Repeated identical values are still ambiguous: every duplicated key is a
+// 400, and two problems in one body are both reported.
+func TestCoordinateDuplicateKeysAllReported(t *testing.T) {
+	body := `{
+		"devices": [
+			{"id":"a","purpose":"handheld","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+			{"id":"b","purpose":"handheld","center_khz":500000,"center_khz":500400,"bandwidth_khz":200}
+		],
+		"devices": [
+			{"id":"c","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+		]
+	}`
+	status, resp := postBody(t, body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+	}
+	errs, ok := resp["errors"].([]any)
+	if !ok {
+		t.Fatalf("errors = %v; want a list", resp["errors"])
+	}
+	got := make(map[string]bool, len(errs))
+	for _, e := range errs {
+		got[e.(map[string]any)["field"].(string)] = true
+	}
+	for _, want := range []string{
+		"devices",
+		"devices[0].purpose",
+		"devices[1].center_khz",
+	} {
+		if !got[want] {
+			t.Errorf("missing error for field %q; got fields %v", want, got)
+		}
+	}
+}
+
 // A non-boolean include_clearance — null included — is a 400 that names the
 // field, reported alongside any device-level problems.
 func TestCoordinateIncludeClearanceTypeError(t *testing.T) {

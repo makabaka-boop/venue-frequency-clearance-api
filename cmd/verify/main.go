@@ -44,6 +44,7 @@ func main() {
 		{"clearance omitted on rejection even when requested", checkClearanceOmittedOnRejection},
 		{"omitted/false include_clearance keeps legacy bytes", checkClearanceSwitchCompatible},
 		{"include_clearance type error is a locatable 400", checkClearanceSwitchTypeError},
+		{"duplicate keys (switch, device list, device field) are rejected", checkDuplicateKeys},
 	}
 
 	failures := 0
@@ -635,6 +636,73 @@ func checkClearanceSwitchTypeError(base string) error {
 }
 
 // --- helpers ---
+
+func checkDuplicateKeys(base string) error {
+	// Duplicated JSON object keys must not be silently last-wins: a request
+	// carrying two clearance switches, two device lists, or two center
+	// frequencies for one device is an ambiguous input and must be refused
+	// with the offending field located.
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{
+			name:  "both clearance switches",
+			body:  `{"include_clearance":false,"include_clearance":true,"devices":[{"id":"solo","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]}`,
+			field: "include_clearance",
+		},
+		{
+			name:  "two device lists",
+			body:  `{"devices":[{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}],"devices":[{"id":"b","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]}`,
+			field: "devices",
+		},
+		{
+			name:  "two center frequencies for one device",
+			body:  `{"devices":[{"id":"a","purpose":"handheld","center_khz":500000,"center_khz":500400,"bandwidth_khz":200}]}`,
+			field: "devices[0].center_khz",
+		},
+	}
+	for _, tc := range cases {
+		status, raw, err := postRaw(base, tc.body)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusBadRequest {
+			return fmt.Errorf("%s: status = %d, want 400, body = %s", tc.name, status, raw)
+		}
+		var e errorResp
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("%s: %w, body = %s", tc.name, err, raw)
+		}
+		if e.Accepted {
+			return fmt.Errorf("%s: accepted = true, want false, body = %s", tc.name, raw)
+		}
+		found := false
+		for _, fe := range e.Errors {
+			if fe.Field == tc.field {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s: no error locating %q, body = %s", tc.name, tc.field, raw)
+		}
+	}
+	return nil
+}
+
+func postRaw(base, body string) (int, []byte, error) {
+	resp, err := http.Post(base+"/v1/coordinate", "application/json", bytes.NewReader([]byte(body)))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, data, nil
+}
 
 func post(base string, body any) (int, []byte, error) {
 	raw, err := json.Marshal(body)

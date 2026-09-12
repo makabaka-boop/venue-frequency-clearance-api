@@ -51,6 +51,20 @@
 - `include_clearance` 不是布尔值（`null`、字符串、数字等）时返回 400，
   错误字段定位为 `include_clearance`，与设备级错误一并报告。
 
+### 禁止重复字段
+
+JSON 标准允许对象内同名键重复出现，其语义未定义；编码库默认"静默取后值"，
+会让一份含歧义的请求按后值裁决。本服务对**同一对象内的任何重复键一律以 400 拒绝**，
+错误定位到重复字段本身（`field` 取**第二次出现**的路径），即使两次取值相同也拒绝：
+
+- 请求顶层同时写两个 `include_clearance`（如先 `false` 后 `true`）→ 定位 `include_clearance`；
+- 请求顶层同时写两份 `devices` → 定位 `devices`，不存在"只裁决最后一份"；
+- 单台设备对象内重复字段（如两个 `center_khz`、两个 `bandwidth_khz`）→
+  定位 `devices[i].center_khz` 等。
+
+重复字段属请求结构错误，先于设备级校验报告；一份请求中的多个重复字段一次性全部列出。
+
+
 ## API
 
 ### `POST /v1/coordinate`
@@ -72,7 +86,7 @@
 | --- | --- | --- |
 | 放行 | 200 | `{"accepted": true, "devices": [{"id","low_khz","high_khz"}, ...]}`；请求带 `include_clearance=true` 时追加 `"clearance": {"minimum_khz", "devices": [{"id","minimum_khz","limiter"}, ...]}` |
 | 越界 / 冲突 | 200 | `{"accepted": false, "out_of_band": [...], "conflicts": [{"first","second"}, ...]}`（即使请求了开关也不含 `clearance`） |
-| 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `devices[2].bandwidth_khz`、`include_clearance` |
+| 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `devices[2].bandwidth_khz`、`include_clearance`；同一 JSON 对象内重复键（如两份 `devices`、两个 `include_clearance`、设备内两个 `center_khz`）同样 400，定位到重复字段 |
 
 另提供 `GET /healthz` 用于健康检查。
 
@@ -202,6 +216,25 @@ $ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: applicat
 {"accepted":false,"errors":[{"field":"include_clearance","message":"must be a boolean, got \"yes\""}]}
 ```
 
+### 9. 重复字段一律拒绝（HTTP 400，不采用后值）
+
+净空开关同时写关闭和开启时，接口不会静默采用后值并返回净空：
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: application/json' -d '{
+  "include_clearance": false,
+  "include_clearance": true,
+  "devices": [
+    {"id": "solo", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200}
+  ]
+}'
+{"accepted":false,"errors":[{"field":"include_clearance","message":"appears more than once in the same JSON object; \"include_clearance\" must be provided at most once"}]}
+```
+
+同理，误填两份不同 `devices` 列表只裁决最后一份的情况不会发生——重复列表以
+`"field":"devices"` 拒绝；单台设备给两个不同 `center_khz` 则以
+`"field":"devices[0].center_khz"` 拒绝，不按最后一个频率计算保护区间。
+
 ## 运行
 
 ### 本地（Go 1.25+）
@@ -218,7 +251,7 @@ $ docker compose up --build api                 # 默认宿主端口 8080
 $ API_PORT=9000 docker compose up --build api   # API_PORT 覆盖宿主端口
 ```
 
-一次性验收服务 `verify`：等待 API 就绪后执行 15 组端到端检查并逐条打印 PASS/FAIL，
+一次性验收服务 `verify`：等待 API 就绪后执行 16 组端到端检查并逐条打印 PASS/FAIL，
 任一失败则以非零码退出：
 
 ```console

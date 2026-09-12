@@ -2,6 +2,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,7 +77,16 @@ func NewRouter() *gin.Engine {
 
 func handleCoordinate(c *gin.Context) {
 	var req coordinateRequest
-	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes))
+	limited := http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		writeErrors(c, http.StatusBadRequest, fieldError{
+			Field:   "",
+			Message: "invalid JSON body: " + err.Error(),
+		})
+		return
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		writeErrors(c, http.StatusBadRequest, fieldError{
@@ -90,6 +100,15 @@ func handleCoordinate(c *gin.Context) {
 			Field:   "",
 			Message: "body must contain a single JSON object",
 		})
+		return
+	}
+
+	// Reject duplicated object keys outright: encoding/json would otherwise
+	// keep the last occurrence, letting an ambiguous switch, fleet list or
+	// device value silently pick the adjudication. These are input-shape
+	// errors, reported before semantic validation.
+	if dupErrs := duplicateKeyErrors(raw); len(dupErrs) > 0 {
+		writeErrors(c, http.StatusBadRequest, dupErrs...)
 		return
 	}
 
