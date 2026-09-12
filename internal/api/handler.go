@@ -193,10 +193,16 @@ func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError)
 }
 
 // parseIncludeClearance reads the optional include_clearance switch. Absent
-// or null means false; anything but a JSON boolean is a type error.
+// means false; anything present that is not a JSON boolean — null included —
+// is a type error.
 func parseIncludeClearance(raw json.RawMessage) (value, ok bool) {
-	if len(raw) == 0 || string(raw) == "null" {
+	if len(raw) == 0 {
 		return false, true
+	}
+	// json.Unmarshal accepts null into a bool without error; reject it
+	// explicitly so only true/false are valid switch values.
+	if string(raw) == "null" {
+		return false, false
 	}
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return false, false

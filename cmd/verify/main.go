@@ -565,8 +565,8 @@ func checkClearanceOmittedOnRejection(base string) error {
 }
 
 func checkClearanceSwitchCompatible(base string) error {
-	// Omitting the switch, or setting it to false or null, must leave the
-	// legacy response byte-for-byte unchanged, accepted or rejected.
+	// Omitting the switch, or setting it to false, must leave the legacy
+	// response byte-for-byte unchanged, accepted or rejected.
 	fleets := []map[string]any{
 		{"devices": []deviceReq{
 			{ID: "solo", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
@@ -587,46 +587,51 @@ func checkClearanceSwitchCompatible(base string) error {
 		if bytes.Contains(legacy, []byte(`"clearance"`)) {
 			return fmt.Errorf("fleet %d: response without the switch contains clearance: %s", i, legacy)
 		}
-		for _, value := range []any{false, nil} {
-			withSwitch := map[string]any{"devices": fleet["devices"], "include_clearance": value}
-			vStatus, vRaw, err := post(base, withSwitch)
-			if err != nil {
-				return err
-			}
-			if vStatus != status {
-				return fmt.Errorf("fleet %d, switch %v: status = %d, want %d", i, value, vStatus, status)
-			}
-			if !bytes.Equal(legacy, vRaw) {
-				return fmt.Errorf("fleet %d, switch %v: response = %s, want byte-identical to %s", i, value, vRaw, legacy)
-			}
+		withSwitch := map[string]any{"devices": fleet["devices"], "include_clearance": false}
+		vStatus, vRaw, err := post(base, withSwitch)
+		if err != nil {
+			return err
+		}
+		if vStatus != status {
+			return fmt.Errorf("fleet %d, switch false: status = %d, want %d", i, vStatus, status)
+		}
+		if !bytes.Equal(legacy, vRaw) {
+			return fmt.Errorf("fleet %d, switch false: response = %s, want byte-identical to %s", i, vRaw, legacy)
 		}
 	}
 	return nil
 }
 
 func checkClearanceSwitchTypeError(base string) error {
-	status, raw, err := post(base, map[string]any{
-		"include_clearance": "yes",
-		"devices": []deviceReq{
-			{ID: "solo", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
-		},
-	})
-	if err != nil {
-		return err
-	}
-	if status != http.StatusBadRequest {
-		return fmt.Errorf("status = %d, want 400, body = %s", status, raw)
-	}
-	var e errorResp
-	if err := json.Unmarshal(raw, &e); err != nil {
-		return err
-	}
-	for _, fe := range e.Errors {
-		if fe.Field == "include_clearance" {
-			return nil
+	// Non-boolean switch values — a string and null — are locatable 400s.
+	for _, value := range []any{"yes", nil} {
+		status, raw, err := post(base, map[string]any{
+			"include_clearance": value,
+			"devices": []deviceReq{
+				{ID: "solo", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if status != http.StatusBadRequest {
+			return fmt.Errorf("switch %v: status = %d, want 400, body = %s", value, status, raw)
+		}
+		var e errorResp
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return err
+		}
+		found := false
+		for _, fe := range e.Errors {
+			if fe.Field == "include_clearance" {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("switch %v: no error locating include_clearance, body = %s", value, raw)
 		}
 	}
-	return fmt.Errorf("no error locating include_clearance, body = %s", raw)
+	return nil
 }
 
 // --- helpers ---

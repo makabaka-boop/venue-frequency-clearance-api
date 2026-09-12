@@ -338,7 +338,7 @@ func TestCoordinateIncludeClearanceMiddleGap(t *testing.T) {
 	}
 }
 
-// Omitted, null, or false include_clearance keeps the legacy response
+// Omitted or false include_clearance keeps the legacy response
 // byte-for-byte, for accepted and rejected fleets alike.
 func TestCoordinateClearanceOmittedUnlessRequested(t *testing.T) {
 	fleets := []string{
@@ -356,15 +356,13 @@ func TestCoordinateClearanceOmittedUnlessRequested(t *testing.T) {
 		if bytes.Contains(legacy, []byte(`"clearance"`)) {
 			t.Errorf("fleet %s: response without the switch contains clearance: %s", fleet, legacy)
 		}
-		for _, variant := range []string{`"include_clearance":false`, `"include_clearance":null`} {
-			body := fleet[:len(fleet)-1] + `,` + variant + `}`
-			vStatus, vRaw := postBodyRaw(t, body)
-			if vStatus != status {
-				t.Errorf("body %s: status = %d; want %d", body, vStatus, status)
-			}
-			if !bytes.Equal(legacy, vRaw) {
-				t.Errorf("body %s: response = %s; want byte-identical to %s", body, vRaw, legacy)
-			}
+		body := fleet[:len(fleet)-1] + `,"include_clearance":false}`
+		vStatus, vRaw := postBodyRaw(t, body)
+		if vStatus != status {
+			t.Errorf("body %s: status = %d; want %d", body, vStatus, status)
+		}
+		if !bytes.Equal(legacy, vRaw) {
+			t.Errorf("body %s: response = %s; want byte-identical to %s", body, vRaw, legacy)
 		}
 	}
 }
@@ -397,10 +395,10 @@ func TestCoordinateClearanceOmittedOnRejection(t *testing.T) {
 	}
 }
 
-// A non-boolean include_clearance is a 400 that names the field, reported
-// alongside any device-level problems.
+// A non-boolean include_clearance — null included — is a 400 that names the
+// field, reported alongside any device-level problems.
 func TestCoordinateIncludeClearanceTypeError(t *testing.T) {
-	for _, value := range []string{`"yes"`, `1`, `{}`, `[]`} {
+	for _, value := range []string{`null`, `"yes"`, `1`, `{}`, `[]`} {
 		body := `{"include_clearance":` + value + `,"devices":[{"id":"x","purpose":"lavalier","center_khz":500000,"bandwidth_khz":200}]}`
 		status, resp := postBody(t, body)
 		if status != http.StatusBadRequest {

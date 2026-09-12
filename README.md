@@ -31,8 +31,8 @@
 ## 频率漂移净空（clearance）
 
 放行只是"当下不冲突"。协调员若想知道方案对频率漂移还有多少余量、哪台设备最脆弱，
-可在请求中带上可选开关 `include_clearance`（JSON 布尔值，省略、`null` 或 `false`
-均表示关闭）。**仅在 `accepted=true` 时**响应追加 `clearance` 字段；拒绝时仍只给出
+可在请求中带上可选开关 `include_clearance`（JSON 布尔值，省略或 `false` 表示关闭）。
+**仅在 `accepted=true` 时**响应追加 `clearance` 字段；拒绝时仍只给出
 `out_of_band` 与 `conflicts`。开关关闭时响应逐字段与不加开关完全一致。
 
 净空以整数 kHz 计算，每台设备取下列候选中的最小值：
@@ -48,7 +48,7 @@
   `clearance.devices` 按设备编号升序，每项含 `id`、`minimum_khz`、`limiter`。
 - 端点压线放行时余量为 0：保护区间贴频段端点，或与邻居仅隔 1 kHz（中间 0 个空闲刻度）。
 - 净空计算与区间计算一样使用饱和算术，极端中心频率不会回绕出颠倒的余量。
-- `include_clearance` 不是布尔值（如字符串、数字）时返回 400，
+- `include_clearance` 不是布尔值（`null`、字符串、数字等）时返回 400，
   错误字段定位为 `include_clearance`，与设备级错误一并报告。
 
 ## API
