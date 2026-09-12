@@ -136,6 +136,7 @@ func NewRouter() *gin.Engine {
 	})
 	r.POST("/v1/coordinate", handleCoordinate)
 	r.POST("/v1/check-retunes", handleCheckRetunes)
+	r.POST("/v1/reconcile-observations", handleReconcileObservations)
 	return r
 }
 

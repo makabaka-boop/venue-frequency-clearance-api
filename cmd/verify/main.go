@@ -57,6 +57,10 @@ func main() {
 		{"retunes: MHz candidates match kHz trials byte-for-byte", checkRetunesMHzMatchesKHz},
 		{"retunes: bad target, empty/duplicate/imprecise candidates are locatable 400s", checkRetunesValidationErrors},
 		{"string-typed numbers are locatable 400s, never trial input", checkStringTypedNumbers},
+		{"reconcile: shuffled inputs match one-to-one, missing and unexpected together", checkReconcileShuffledOneToOne},
+		{"reconcile: closest pair wins deterministic ties, stable across repeats", checkReconcileTieBreak},
+		{"reconcile: MHz observations match the equivalent kHz result byte-for-byte", checkReconcileMHzMatchesKHz},
+		{"reconcile: illegal tolerance and records are locatable 400s, boundaries accepted", checkReconcileValidationErrors},
 	}
 
 	failures := 0
@@ -1354,6 +1358,341 @@ func post(base string, body any) (int, []byte, error) {
 		return 0, nil, err
 	}
 	return resp.StatusCode, data, nil
+}
+
+// --- post-show observation reconciliation ---
+
+// reconcileMatch is one matched entry in a reconcile response.
+type reconcileMatch struct {
+	DeviceID       string `json:"device_id"`
+	ObservationID  string `json:"observation_id"`
+	ObservedCenter int64  `json:"observed_center_khz"`
+	DeviationKHz   int64  `json:"deviation_khz"`
+}
+
+type reconcileObservation struct {
+	ID        string `json:"id"`
+	CenterKHz int64  `json:"center_khz"`
+}
+
+type reconcileResp struct {
+	Matched    []reconcileMatch       `json:"matched"`
+	Missing    []string               `json:"missing"`
+	Unexpected []reconcileObservation `json:"unexpected"`
+}
+
+func postReconcile(base, body string) (int, []byte, error) {
+	resp, err := http.Post(base+"/v1/reconcile-observations", "application/json", bytes.NewReader([]byte(body)))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, data, nil
+}
+
+// checkReconcileShuffledOneToOne exercises the whole point of the endpoint:
+// devices and observations arrive in arbitrary orders, the match is
+// one-to-one, and a missing device and an extra carrier coexist in one
+// result. Reordering both lists must not change a byte.
+func checkReconcileShuffledOneToOne(base string) error {
+	body := `{"tolerance_khz":100,"devices":[
+		{"id":"d","purpose":"handheld","center_khz":650000,"bandwidth_khz":200},
+		{"id":"b","purpose":"bodypack","center_khz":500050,"bandwidth_khz":100},
+		{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+		{"id":"c","purpose":"ifb","center_khz":600000,"bandwidth_khz":200}
+	],"observations":[
+		{"id":"obs-2","center_khz":500040},
+		{"id":"obs-ghost","center_khz":550000},
+		{"id":"obs-3","center_khz":600000},
+		{"id":"obs-1","center_khz":500010}
+	]}`
+	status, raw, err := postReconcile(base, body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status = %d, want 200, body = %s", status, raw)
+	}
+	var r reconcileResp
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return err
+	}
+	wantMatched := []reconcileMatch{
+		{DeviceID: "a", ObservationID: "obs-1", ObservedCenter: 500010, DeviationKHz: 10},
+		{DeviceID: "b", ObservationID: "obs-2", ObservedCenter: 500040, DeviationKHz: -10},
+		{DeviceID: "c", ObservationID: "obs-3", ObservedCenter: 600000, DeviationKHz: 0},
+	}
+	if !reflect.DeepEqual(r.Matched, wantMatched) {
+		return fmt.Errorf("matched = %+v, want %+v", r.Matched, wantMatched)
+	}
+	if !reflect.DeepEqual(r.Missing, []string{"d"}) {
+		return fmt.Errorf("missing = %v, want [d]", r.Missing)
+	}
+	if !reflect.DeepEqual(r.Unexpected, []reconcileObservation{{ID: "obs-ghost", CenterKHz: 550000}}) {
+		return fmt.Errorf("unexpected = %+v, want [obs-ghost]", r.Unexpected)
+	}
+
+	// Same fleet and carriers in different orders: byte-identical response.
+	shuffled := `{"tolerance_khz":100,"devices":[
+		{"id":"c","purpose":"ifb","center_khz":600000,"bandwidth_khz":200},
+		{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+		{"id":"d","purpose":"handheld","center_khz":650000,"bandwidth_khz":200},
+		{"id":"b","purpose":"bodypack","center_khz":500050,"bandwidth_khz":100}
+	],"observations":[
+		{"id":"obs-3","center_khz":600000},
+		{"id":"obs-1","center_khz":500010},
+		{"id":"obs-ghost","center_khz":550000},
+		{"id":"obs-2","center_khz":500040}
+	]}`
+	_, reordered, err := postReconcile(base, shuffled)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(raw, reordered) {
+		return fmt.Errorf("reordered input differs:\n%s\n%s", raw, reordered)
+	}
+
+	// One carrier within tolerance of two devices must go to the nearer one:
+	// b at 500010 is 1 kHz from obs-near at 500009; a at 500000 is 9 kHz
+	// away, so b occupies it and a goes missing (with tolerance 10).
+	ambiguous := `{"tolerance_khz":10,"devices":[
+		{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+		{"id":"b","purpose":"handheld","center_khz":500010,"bandwidth_khz":200}
+	],"observations":[{"id":"obs-near","center_khz":500009}]}`
+	status, raw, err = postReconcile(base, ambiguous)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("ambiguous: status = %d, want 200, body = %s", status, raw)
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return err
+	}
+	wantAmbiguous := []reconcileMatch{{DeviceID: "b", ObservationID: "obs-near", ObservedCenter: 500009, DeviationKHz: -1}}
+	if !reflect.DeepEqual(r.Matched, wantAmbiguous) || !reflect.DeepEqual(r.Missing, []string{"a"}) || len(r.Unexpected) != 0 {
+		return fmt.Errorf("ambiguous: matched=%+v missing=%v unexpected=%+v, want b/obs-near, [a], []", r.Matched, r.Missing, r.Unexpected)
+	}
+	return nil
+}
+
+// checkReconcileTieBreak pins the total ordering of candidate pairs: exact
+// frequency ties break on device id then observation id, so two devices
+// planned at one center and two equidistant carriers always pair a/o1, b/o2,
+// whatever order they were submitted in.
+func checkReconcileTieBreak(base string) error {
+	cases := []string{
+		`{"tolerance_khz":10,"devices":[
+			{"id":"b","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+			{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+		],"observations":[
+			{"id":"o2","center_khz":500005},
+			{"id":"o1","center_khz":500005}
+		]}`,
+		`{"tolerance_khz":10,"devices":[
+			{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+			{"id":"b","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+		],"observations":[
+			{"id":"o1","center_khz":500005},
+			{"id":"o2","center_khz":500005}
+		]}`,
+	}
+	want := `{"matched":[` +
+		`{"device_id":"a","observation_id":"o1","observed_center_khz":500005,"deviation_khz":5},` +
+		`{"device_id":"b","observation_id":"o2","observed_center_khz":500005,"deviation_khz":5}` +
+		`],"missing":[],"unexpected":[]}`
+	var first []byte
+	for i, body := range cases {
+		status, raw, err := postReconcile(base, body)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK || string(raw) != want {
+			return fmt.Errorf("case %d: got %d %s, want 200 %s", i, status, raw, want)
+		}
+		if i == 0 {
+			first = raw
+		} else if !bytes.Equal(first, raw) {
+			return fmt.Errorf("tie orders differ:\n%s\n%s", first, raw)
+		}
+	}
+	return nil
+}
+
+// checkReconcileMHzMatchesKHz verifies the unit conversion is reused end to
+// end: device and observation centers in MHz are converted to integer kHz
+// before matching, and the response is byte-identical to the kHz request.
+// tolerance_khz stays an integer kHz even in MHz mode.
+func checkReconcileMHzMatchesKHz(base string) error {
+	mhz := `{"frequency_unit":"mhz","tolerance_khz":100,"devices":[
+		{"id":"d","purpose":"handheld","center_khz":650,"bandwidth_khz":0.2},
+		{"id":"b","purpose":"bodypack","center_khz":500.050,"bandwidth_khz":0.1},
+		{"id":"a","purpose":"handheld","center_khz":500.000,"bandwidth_khz":0.2},
+		{"id":"c","purpose":"ifb","center_khz":600,"bandwidth_khz":0.2}
+	],"observations":[
+		{"id":"obs-2","center_khz":500.040},
+		{"id":"obs-ghost","center_khz":550},
+		{"id":"obs-3","center_khz":600.000},
+		{"id":"obs-1","center_khz":500.010}
+	]}`
+	status, mhzRaw, err := postReconcile(base, mhz)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("mhz: status = %d, want 200, body = %s", status, mhzRaw)
+	}
+	khz := `{"tolerance_khz":100,"devices":[
+		{"id":"d","purpose":"handheld","center_khz":650000,"bandwidth_khz":200},
+		{"id":"b","purpose":"bodypack","center_khz":500050,"bandwidth_khz":100},
+		{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+		{"id":"c","purpose":"ifb","center_khz":600000,"bandwidth_khz":200}
+	],"observations":[
+		{"id":"obs-2","center_khz":500040},
+		{"id":"obs-ghost","center_khz":550000},
+		{"id":"obs-3","center_khz":600000},
+		{"id":"obs-1","center_khz":500010}
+	]}`
+	status, khzRaw, err := postReconcile(base, khz)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("khz: status = %d, want 200, body = %s", status, khzRaw)
+	}
+	if !bytes.Equal(mhzRaw, khzRaw) {
+		return fmt.Errorf("MHz and kHz responses differ:\n%s\n%s", mhzRaw, khzRaw)
+	}
+
+	// A MHz observation with four decimals is a locatable 400, and a
+	// fractional MHz tolerance is still an integer-kHz type error.
+	status, raw, err := postReconcile(base, `{"frequency_unit":"mhz","tolerance_khz":100,"devices":[
+		{"id":"a","purpose":"handheld","center_khz":500,"bandwidth_khz":0.2}
+	],"observations":[{"id":"o1","center_khz":500.0001}]}`)
+	if err != nil {
+		return err
+	}
+	if err := expectReconcileFieldError(status, raw, "four-decimal observation", "observations[0].center_khz"); err != nil {
+		return err
+	}
+	status, raw, err = postReconcile(base, `{"frequency_unit":"mhz","tolerance_khz":0.1,"devices":[
+		{"id":"a","purpose":"handheld","center_khz":500,"bandwidth_khz":0.2}
+	],"observations":[{"id":"o1","center_khz":500}]}`)
+	if err != nil {
+		return err
+	}
+	if err := expectReconcileFieldError(status, raw, "fractional tolerance", "tolerance_khz"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkReconcileValidationErrors pins every request-shape failure to its
+// field with the same error envelope as the other endpoints, including the
+// tolerance boundaries 0 and 10000 being accepted and observation list
+// limits of 1 and 500.
+func checkReconcileValidationErrors(base string) error {
+	fleet := `[{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]`
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"missing tolerance", `{"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`, "tolerance_khz"},
+		{"fractional tolerance", `{"tolerance_khz":1.5,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`, "tolerance_khz"},
+		{"negative tolerance", `{"tolerance_khz":-1,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`, "tolerance_khz"},
+		{"tolerance above 10000", `{"tolerance_khz":10001,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`, "tolerance_khz"},
+		{"string tolerance", `{"tolerance_khz":"100","devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`, "tolerance_khz"},
+		{"null tolerance", `{"tolerance_khz":null,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`, "tolerance_khz"},
+		{"missing observations", `{"tolerance_khz":100,"devices":` + fleet + `}`, "observations"},
+		{"empty observations", `{"tolerance_khz":100,"devices":` + fleet + `,"observations":[]}`, "observations"},
+		{"duplicate observation id", `{"tolerance_khz":100,"devices":` + fleet + `,"observations":[{"id":"x","center_khz":500000},{"id":"x","center_khz":500000}]}`, "observations[1].id"},
+		{"empty observation id", `{"tolerance_khz":100,"devices":` + fleet + `,"observations":[{"id":"","center_khz":500000}]}`, "observations[0].id"},
+		{"fractional observation center", `{"tolerance_khz":100,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000.5}]}`, "observations[0].center_khz"},
+		{"string observation center", `{"tolerance_khz":100,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":"500000"}]}`, "observations[0].center_khz"},
+		{"device validation reused", `{"tolerance_khz":100,"devices":[{"id":"a","purpose":"nope","center_khz":500000,"bandwidth_khz":24}],"observations":[{"id":"o1","center_khz":500000}]}`, "devices[0].purpose"},
+		{"unknown frequency_unit", `{"frequency_unit":"khz","tolerance_khz":100,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`, "frequency_unit"},
+		{"duplicated tolerance key", `{"tolerance_khz":100,"tolerance_khz":100,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`, "tolerance_khz"},
+	}
+	for _, tc := range cases {
+		status, raw, err := postReconcile(base, tc.body)
+		if err != nil {
+			return err
+		}
+		if err := expectReconcileFieldError(status, raw, tc.name, tc.field); err != nil {
+			return err
+		}
+	}
+
+	// Tolerance boundaries 0 and 10000 are accepted; the frequency at the
+	// exact boundary matches, one kHz past it does not.
+	exact := `{"tolerance_khz":0,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":500000}]}`
+	if status, raw, err := postReconcile(base, exact); err != nil {
+		return err
+	} else if status != http.StatusOK {
+		return fmt.Errorf("tolerance 0: status = %d, want 200, body = %s", status, raw)
+	}
+	atMax := `{"tolerance_khz":10000,"devices":` + fleet + `,"observations":[{"id":"o1","center_khz":510000}]}`
+	status, raw, err := postReconcile(base, atMax)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("tolerance 10000: status = %d, want 200, body = %s", status, raw)
+	}
+	var r reconcileResp
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return err
+	}
+	if len(r.Matched) != 1 || r.Matched[0].DeviationKHz != 10000 {
+		return fmt.Errorf("tolerance 10000 boundary: matched = %+v, want one match with deviation 10000", r.Matched)
+	}
+
+	// 500 observations is the largest accepted request; 501 locates the list.
+	many := make([]string, 0, 501)
+	for i := 0; i < 501; i++ {
+		many = append(many, fmt.Sprintf(`{"id":"o-%03d","center_khz":500000}`, i))
+	}
+	status, raw, err = postReconcile(base, `{"tolerance_khz":100,"devices":`+fleet+`,"observations":[`+strings.Join(many[:500], ",")+`]}`)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("500 observations: status = %d, want 200, body = %s", status, raw)
+	}
+	status, raw, err = postReconcile(base, `{"tolerance_khz":100,"devices":`+fleet+`,"observations":[`+strings.Join(many, ",")+`]}`)
+	if err != nil {
+		return err
+	}
+	if err := expectReconcileFieldError(status, raw, "501 observations", "observations"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// expectReconcileFieldError wants a 400 error envelope whose list locates
+// field and reports accepted=false.
+func expectReconcileFieldError(status int, raw []byte, name, field string) error {
+	if status != http.StatusBadRequest {
+		return fmt.Errorf("%s: status = %d, want 400, body = %s", name, status, raw)
+	}
+	var e errorResp
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return fmt.Errorf("%s: %w, body = %s", name, err, raw)
+	}
+	if e.Accepted {
+		return fmt.Errorf("%s: accepted = true, want false, body = %s", name, raw)
+	}
+	for _, fe := range e.Errors {
+		if fe.Field == field {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s: no error locating %q, body = %s", name, field, raw)
 }
 
 func waitReady(base string, timeout time.Duration) error {

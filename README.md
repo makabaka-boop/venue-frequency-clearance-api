@@ -118,6 +118,41 @@ MHz 模式下下列情况返回定位到设备属性的 400（与其他设备级
 | 候选归一化（换算成 kHz）后重复（如 MHz 下 `500` 与 `500.000`） | `candidate_centers_khz[j]`（后一次出现） |
 | 同一对象内重复键（两个 `target_id`、两份候选数组等） | 重复字段本身 |
 
+## 进场核对（`reconcile-observations`）
+
+放行裁决回答的是"方案能不能演"；演出进场后，协调员用频谱仪把现场实际抓到的载波记录下来，要回答的是另一个
+问题——**方案里的设备有没有都开、有没有多开或开偏**。`POST /v1/reconcile-observations` 接收与
+`/v1/coordinate` 完全同构的 `devices`、1 至 500 条 `observations`（每条含唯一非空 `id` 与
+`center_khz`）以及必填的 `tolerance_khz`（**0 至 10000 的整数 kHz**，闭区间，与 `frequency_unit`
+无关，始终按 kHz 解释），把现场载波与方案设备**一对一占用**，而**不重新做放行裁决**：响应里没有
+`accepted`、`conflicts` 或保护区间，设备的 `purpose` / `bandwidth_khz` 只用于复用既有设备校验。
+
+占用规则（纯领域层，输入顺序无关）：
+
+1. 枚举所有 `|实测中心 − 方案中心| ≤ tolerance_khz` 的设备/观测候选对；
+2. 候选对按 **(频差绝对值, 设备编号, 观测编号)** 升序排序后依次占用，已被占用的设备或观测跳过——
+   最近的一对先占，任一设备与任一观测最多占用一次；
+3. 按设备编号升序输出 `matched`（含观测编号、实测中心 `observed_center_khz`、有符号偏差
+   `deviation_khz = 实测 − 方案`）；没占到观测的设备按编号列入 `missing`（漏开）；没被设备占用的
+   观测按观测编号列入 `unexpected`（误开或偏频到对不上任何方案）。每条合法记录恰好在三个桶之一。
+
+合法但没匹配上的数据（漏开、多开、偏频超出容差）是**核对结论（200）**，不是请求错误；只有结构与
+数值不合法才返回 400。`frequency_unit:"mhz"` 对设备与观测的 `center_khz` 同样在 HTTP 层定点换算成
+整数 kHz 后再匹配，容差本身永远是整数 kHz；MHz 请求与提交等价整数 kHz 的请求响应逐字节一致。
+
+下列情况使用与其他接口相同的错误信封 `{"accepted":false,"errors":[{"field","message"}]}` 返回
+定位到字段的 400（一份请求里的多个问题一次性全部列出）：
+
+| 问题 | 定位字段 |
+| --- | --- |
+| 设备字段非法（编号空/重复、用途未知、中心/带宽数值或精度非法、带宽越界等） | `devices[i].id` / `devices[i].purpose` / `devices[i].center_khz` / `devices[i].bandwidth_khz`（与 `/v1/coordinate` 完全相同的校验） |
+| `observations` 缺失、为空或超过 500 条 | `observations` |
+| 观测 `id` 为空或与前一条重复 | `observations[i].id` |
+| 观测 `center_khz` 非 JSON 数字、kHz 非整数、MHz 超三位小数、指数记法或换算超出 int64 | `observations[i].center_khz` |
+| `tolerance_khz` 缺失、`null`、非整数（如 `1.5`）、字符串数字、布尔或越出 `[0, 10000]` | `tolerance_khz` |
+| `frequency_unit` 取值未知或类型错误 | `frequency_unit` |
+| 同一对象内重复键（两份 `observations`、两个 `tolerance_khz`、观测对象内两个 `center_khz` 等） | 重复字段本身（`observations` / `tolerance_khz` / `observations[i].center_khz`） |
+
 ## API
 
 ### `POST /v1/coordinate`
@@ -163,6 +198,30 @@ MHz 模式下下列情况返回定位到设备属性的 400（与其他设备级
 | --- | --- | --- |
 | 试算完成 | 200 | `{"results": [{"center_khz","accepted"}, ...]}`，按换算后中心频率升序；被拒绝的候选追加 `"out_of_band": [...]`、`"conflicts": [...]` |
 | 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `target_id`、`candidate_centers_khz[2]` |
+
+### `POST /v1/reconcile-observations`
+
+请求体（`frequency_unit` 可选，语义同 `/v1/coordinate`；`tolerance_khz` 必填，永远为整数 kHz）：
+
+```json
+{
+  "frequency_unit": "mhz",
+  "tolerance_khz": 100,
+  "devices": [
+    {"id": "a", "purpose": "handheld", "center_khz": 500.0, "bandwidth_khz": 0.2}
+  ],
+  "observations": [
+    {"id": "obs-1", "center_khz": 500.01}
+  ]
+}
+```
+
+响应：
+
+| 情形 | HTTP | 正文 |
+| --- | --- | --- |
+| 核对完成 | 200 | `{"matched":[{"device_id","observation_id","observed_center_khz","deviation_khz"}, ...],"missing":["id", ...],"unexpected":[{"id","center_khz"}, ...]}`；`matched` 按设备编号升序，`missing` 按设备编号升序，`unexpected` 按观测编号升序，空列表输出 `[]` |
+| 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `devices[2].bandwidth_khz`、`observations[0].center_khz`、`observations[3].id`、`tolerance_khz`、`frequency_unit` |
 
 另提供 `GET /healthz` 用于健康检查。
 
@@ -371,6 +430,57 @@ $ curl -s -X POST http://localhost:8080/v1/check-retunes -H 'Content-Type: appli
 而候选 `470000` 这类合法数值导致保护区间越界时，结论体现在该候选的
 `accepted:false` 与 `out_of_band` 明细中，请求本身仍是 200。
 
+### 12. 进场核对：乱序提交仍确定性一对一，漏开与多余同时出现
+
+方案设备（按提交顺序）`d 650000`、`b 500050`、`a 500000`、`c 600000`；频谱仪载波记录
+`obs-2 500040`、`obs-ghost 550000`、`obs-3 600000`、`obs-1 500010`，容差 100 kHz：
+
+- `a`↔`obs-1` 频差 10（偏差 **+10**），`b`↔`obs-2` 频差 10（偏差 **−10**），
+  `c`↔`obs-3` 频差 0，各设备与观测都只被占用一次；
+- `d`（650000，容差内无载波）→ `missing`（漏开）；
+- `obs-ghost`（550000，容差内无设备）→ `unexpected`（多余载波）。
+
+设备与观测都乱序提交，输出仍按设备编号 / 观测编号确定排序，重复请求逐字节一致：
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/reconcile-observations -H 'Content-Type: application/json' -d '{
+  "tolerance_khz": 100,
+  "devices": [
+    {"id": "d", "purpose": "handheld", "center_khz": 650000, "bandwidth_khz": 200},
+    {"id": "b", "purpose": "bodypack", "center_khz": 500050, "bandwidth_khz": 100},
+    {"id": "a", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200},
+    {"id": "c", "purpose": "ifb",      "center_khz": 600000, "bandwidth_khz": 200}
+  ],
+  "observations": [
+    {"id": "obs-2",     "center_khz": 500040},
+    {"id": "obs-ghost", "center_khz": 550000},
+    {"id": "obs-3",     "center_khz": 600000},
+    {"id": "obs-1",     "center_khz": 500010}
+  ]
+}'
+{"matched":[{"device_id":"a","observation_id":"obs-1","observed_center_khz":500010,"deviation_khz":10},{"device_id":"b","observation_id":"obs-2","observed_center_khz":500040,"deviation_khz":-10},{"device_id":"c","observation_id":"obs-3","observed_center_khz":600000,"deviation_khz":0}],"missing":["d"],"unexpected":[{"id":"obs-ghost","center_khz":550000}]}
+```
+
+同一份核对改用 `"frequency_unit":"mhz"`、设备与观测分别填 `650` / `500.050` / `500.040` 等
+MHz 数字（容差仍是 kHz 整数 `100`），响应与本例**逐字节一致**。最近对优先占用可在歧义处消歧：
+若一条载波同时落在两台设备容差内，它先归频差更小的设备，被挤掉的设备进 `missing`。
+
+非法容差是定位到 `tolerance_khz` 的 400，且与其他字段错误一并报告：
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/reconcile-observations -H 'Content-Type: application/json' -d '{
+  "tolerance_khz": 1.5,
+  "devices":      [{"id": "a", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200}],
+  "observations": [{"id": "o1", "center_khz": 500000}]
+}'
+{"accepted":false,"errors":[{"field":"tolerance_khz","message":"must be an integer number of kHz, got 1.5"}]}
+```
+
+`-1`、`10001` 报 `must be between 0 and 10000 kHz, got …`；`"100"`、`true`、`null`、缺失分别
+按类型错误 / 必填错误定位 `tolerance_khz`。观测编号重复定位 `observations[j].id`，观测中心非法
+（如 `"500000"`、kHz 小数、MHz 四位小数）定位 `observations[i].center_khz`，设备侧错误与
+`/v1/coordinate` 的文案和定位完全相同。
+
 ## 运行
 
 ### 本地（Go 1.25+）
@@ -387,7 +497,7 @@ $ docker compose up --build api                 # 默认宿主端口 8080
 $ API_PORT=9000 docker compose up --build api   # API_PORT 覆盖宿主端口
 ```
 
-一次性验收服务 `verify`：等待 API 就绪后执行 27 组端到端检查并逐条打印 PASS/FAIL，
+一次性验收服务 `verify`：等待 API 就绪后执行 31 组端到端检查并逐条打印 PASS/FAIL，
 任一失败则以非零码退出：
 
 ```console
@@ -402,7 +512,7 @@ $ docker compose up --build --exit-code-from verify verify
 ```
 cmd/server/main.go        # 服务入口（PORT，默认 8080）
 cmd/verify/main.go        # 一次性验收程序
-internal/rules/           # 纯领域规则：保护区间、越界、冲突、裁决、漂移净空
+internal/rules/           # 纯领域规则：保护区间、越界、冲突、裁决、漂移净空、进场核对匹配
 internal/rules/rules_test.go
 internal/api/             # Gin HTTP 层：请求校验、字段级错误、可选字段与响应整形
 internal/api/handler_test.go
