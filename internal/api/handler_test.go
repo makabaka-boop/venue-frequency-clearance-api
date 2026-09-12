@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -219,5 +220,205 @@ func TestCoordinateCenterBeyondInt64(t *testing.T) {
 	}
 	if errs[0].(map[string]any)["field"] != "devices[0].center_khz" {
 		t.Errorf("error field = %v; want devices[0].center_khz", errs[0])
+	}
+}
+
+// A lone device far from every edge is limited by the nearer band endpoint.
+func TestCoordinateIncludeClearanceSingleDevice(t *testing.T) {
+	status, raw := postBodyRaw(t, `{
+		"include_clearance": true,
+		"devices": [{"id":"solo","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]
+	}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d; want 200, body = %s", status, raw)
+	}
+	var resp struct {
+		Accepted  bool `json:"accepted"`
+		Clearance struct {
+			MinimumKHz int64 `json:"minimum_khz"`
+			Devices    []struct {
+				ID         string `json:"id"`
+				MinimumKHz int64  `json:"minimum_khz"`
+				Limiter    string `json:"limiter"`
+			} `json:"devices"`
+		} `json:"clearance"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.Accepted {
+		t.Fatalf("accepted = false; want true, body = %s", raw)
+	}
+	// Protected [499775, 500225]: band_low 29775, band_high 193775.
+	if resp.Clearance.MinimumKHz != 29775 {
+		t.Errorf("clearance.minimum_khz = %d; want 29775", resp.Clearance.MinimumKHz)
+	}
+	if len(resp.Clearance.Devices) != 1 {
+		t.Fatalf("clearance.devices = %+v; want 1 entry", resp.Clearance.Devices)
+	}
+	d := resp.Clearance.Devices[0]
+	if d.ID != "solo" || d.MinimumKHz != 29775 || d.Limiter != "band_low" {
+		t.Errorf("clearance.devices[0] = %+v; want {solo 29775 band_low}", d)
+	}
+}
+
+// Three devices submitted out of order: the global minimum comes from the
+// gap around the middle device, and the response is byte-stable.
+func TestCoordinateIncludeClearanceMiddleGap(t *testing.T) {
+	body := `{
+		"include_clearance": true,
+		"devices": [
+			{"id":"mic-c","purpose":"ifb","center_khz":600000,"bandwidth_khz":201},
+			{"id":"mic-a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+			{"id":"mic-b","purpose":"handheld","center_khz":500500,"bandwidth_khz":200}
+		]
+	}`
+	status, raw := postBodyRaw(t, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d; want 200, body = %s", status, raw)
+	}
+	var resp struct {
+		Accepted  bool `json:"accepted"`
+		Clearance struct {
+			MinimumKHz int64 `json:"minimum_khz"`
+			Devices    []struct {
+				ID         string `json:"id"`
+				MinimumKHz int64  `json:"minimum_khz"`
+				Limiter    string `json:"limiter"`
+			} `json:"devices"`
+		} `json:"clearance"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.Accepted {
+		t.Fatalf("accepted = false; want true, body = %s", raw)
+	}
+	// Protected: a [499775,500225], b [500275,500725], c [599650,600351].
+	// gap a<->b = 49 ticks; c band_high = 694000-600351 = 93649.
+	type entry struct {
+		id, limiter string
+		min         int64
+	}
+	want := []entry{
+		{"mic-a", "mic-b", 49},
+		{"mic-b", "mic-a", 49},
+		{"mic-c", "band_high", 93649},
+	}
+	if resp.Clearance.MinimumKHz != 49 {
+		t.Errorf("clearance.minimum_khz = %d; want 49", resp.Clearance.MinimumKHz)
+	}
+	if len(resp.Clearance.Devices) != len(want) {
+		t.Fatalf("clearance.devices = %+v; want %d entries", resp.Clearance.Devices, len(want))
+	}
+	for i, w := range want {
+		got := resp.Clearance.Devices[i]
+		if got.ID != w.id || got.MinimumKHz != w.min || got.Limiter != w.limiter {
+			t.Errorf("clearance.devices[%d] = %+v; want {%s %d %s}", i, got, w.id, w.min, w.limiter)
+		}
+	}
+
+	// Repeating the same request, and submitting the same fleet in a
+	// different order, must yield byte-identical responses.
+	_, repeat := postBodyRaw(t, body)
+	if !bytes.Equal(raw, repeat) {
+		t.Errorf("repeated request differs:\n%s\n%s", raw, repeat)
+	}
+	shuffled := `{
+		"include_clearance": true,
+		"devices": [
+			{"id":"mic-b","purpose":"handheld","center_khz":500500,"bandwidth_khz":200},
+			{"id":"mic-c","purpose":"ifb","center_khz":600000,"bandwidth_khz":201},
+			{"id":"mic-a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+		]
+	}`
+	_, reordered := postBodyRaw(t, shuffled)
+	if !bytes.Equal(raw, reordered) {
+		t.Errorf("reordered fleet differs:\n%s\n%s", raw, reordered)
+	}
+}
+
+// Omitted, null, or false include_clearance keeps the legacy response
+// byte-for-byte, for accepted and rejected fleets alike.
+func TestCoordinateClearanceOmittedUnlessRequested(t *testing.T) {
+	fleets := []string{
+		`{"devices":[{"id":"solo","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]}`,
+		`{"devices":[
+			{"id":"b","purpose":"handheld","center_khz":500450,"bandwidth_khz":200},
+			{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+		]}`,
+	}
+	for _, fleet := range fleets {
+		status, legacy := postBodyRaw(t, fleet)
+		if status != http.StatusOK {
+			t.Fatalf("fleet %s: status = %d; want 200, body = %s", fleet, status, legacy)
+		}
+		if bytes.Contains(legacy, []byte(`"clearance"`)) {
+			t.Errorf("fleet %s: response without the switch contains clearance: %s", fleet, legacy)
+		}
+		for _, variant := range []string{`"include_clearance":false`, `"include_clearance":null`} {
+			body := fleet[:len(fleet)-1] + `,` + variant + `}`
+			vStatus, vRaw := postBodyRaw(t, body)
+			if vStatus != status {
+				t.Errorf("body %s: status = %d; want %d", body, vStatus, status)
+			}
+			if !bytes.Equal(legacy, vRaw) {
+				t.Errorf("body %s: response = %s; want byte-identical to %s", body, vRaw, legacy)
+			}
+		}
+	}
+}
+
+// A rejected fleet reports only out-of-band and conflict details, even when
+// clearance was requested.
+func TestCoordinateClearanceOmittedOnRejection(t *testing.T) {
+	status, raw := postBodyRaw(t, `{
+		"include_clearance": true,
+		"devices": [
+			{"id":"b","purpose":"handheld","center_khz":500450,"bandwidth_khz":200},
+			{"id":"a","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+		]
+	}`)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d; want 200, body = %s", status, raw)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["accepted"] != false {
+		t.Fatalf("accepted = %v; want false, body = %s", resp["accepted"], raw)
+	}
+	if _, present := resp["clearance"]; present {
+		t.Errorf("rejected response carries clearance: %s", raw)
+	}
+	if _, present := resp["conflicts"]; !present {
+		t.Errorf("rejected response lost conflicts: %s", raw)
+	}
+}
+
+// A non-boolean include_clearance is a 400 that names the field, reported
+// alongside any device-level problems.
+func TestCoordinateIncludeClearanceTypeError(t *testing.T) {
+	for _, value := range []string{`"yes"`, `1`, `{}`, `[]`} {
+		body := `{"include_clearance":` + value + `,"devices":[{"id":"x","purpose":"lavalier","center_khz":500000,"bandwidth_khz":200}]}`
+		status, resp := postBody(t, body)
+		if status != http.StatusBadRequest {
+			t.Fatalf("include_clearance=%s: status = %d; want 400, resp = %v", value, status, resp)
+		}
+		errs, ok := resp["errors"].([]any)
+		if !ok {
+			t.Fatalf("include_clearance=%s: errors = %v; want a list", value, resp["errors"])
+		}
+		got := make(map[string]bool, len(errs))
+		for _, e := range errs {
+			got[e.(map[string]any)["field"].(string)] = true
+		}
+		if !got["include_clearance"] {
+			t.Errorf("include_clearance=%s: missing error for the switch itself; got fields %v", value, got)
+		}
+		if !got["devices[0].purpose"] {
+			t.Errorf("include_clearance=%s: device-level error dropped; got fields %v", value, got)
+		}
 	}
 }

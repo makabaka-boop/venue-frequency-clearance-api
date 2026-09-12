@@ -297,3 +297,166 @@ func TestAdjudicateAcceptedFleetIntervalsSortedByID(t *testing.T) {
 		t.Errorf("Intervals = %+v; want %+v", v.Intervals, want)
 	}
 }
+
+// A lone device far from every edge is limited by the nearer band endpoint.
+func TestComputeClearanceSingleDeviceBandLimited(t *testing.T) {
+	v := Adjudicate([]Device{
+		{ID: "solo", Purpose: PurposeHandheld, CenterKHz: 500000, BandwidthKHz: 200}, // [499775, 500225]
+	})
+	if !v.Accepted {
+		t.Fatalf("Accepted = false; want true, verdict %+v", v)
+	}
+	// band_low: 499775-470000 = 29775; band_high: 694000-500225 = 193775.
+	got := ComputeClearance(v.Intervals)
+	want := Clearance{
+		MinimumKHz: 29775,
+		Devices: []DeviceClearance{
+			{ID: "solo", MinimumKHz: 29775, Limiter: LimiterBandLow},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ComputeClearance = %+v; want %+v", got, want)
+	}
+}
+
+// Three devices submitted out of order: the global minimum comes from the
+// gap around the middle device, not from any band edge.
+func TestComputeClearanceMiddleNeighborGapDecides(t *testing.T) {
+	fleet := []Device{
+		{ID: "mic-c", Purpose: PurposeIFB, CenterKHz: 600000, BandwidthKHz: 201},      // [599650, 600351]
+		{ID: "mic-a", Purpose: PurposeHandheld, CenterKHz: 500000, BandwidthKHz: 200}, // [499775, 500225]
+		{ID: "mic-b", Purpose: PurposeHandheld, CenterKHz: 500500, BandwidthKHz: 200}, // [500275, 500725]
+	}
+	v := Adjudicate(fleet)
+	if !v.Accepted {
+		t.Fatalf("Accepted = false; want true, verdict %+v", v)
+	}
+	// gap a->b: 500275-500225-1 = 49; gap b->c: 599650-500725-1 = 98924.
+	// c band_high: 694000-600351 = 93649 beats its other candidates.
+	got := ComputeClearance(v.Intervals)
+	want := Clearance{
+		MinimumKHz: 49,
+		Devices: []DeviceClearance{
+			{ID: "mic-a", MinimumKHz: 49, Limiter: "mic-b"},
+			{ID: "mic-b", MinimumKHz: 49, Limiter: "mic-a"},
+			{ID: "mic-c", MinimumKHz: 93649, Limiter: LimiterBandHigh},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ComputeClearance = %+v; want %+v", got, want)
+	}
+}
+
+// Protected intervals one kHz apart leave zero unoccupied ticks between
+// them, so the clearance floor is exactly 0 while the fleet is accepted.
+func TestComputeClearanceOneKHzApartIsZero(t *testing.T) {
+	fleet := []Device{
+		{ID: "a", Purpose: PurposeHandheld, CenterKHz: 500000, BandwidthKHz: 200}, // [499775, 500225]
+		{ID: "b", Purpose: PurposeHandheld, CenterKHz: 500451, BandwidthKHz: 200}, // [500226, 500676]
+	}
+	v := Adjudicate(fleet)
+	if !v.Accepted {
+		t.Fatalf("Accepted = false; want true, verdict %+v", v)
+	}
+	got := ComputeClearance(v.Intervals)
+	want := Clearance{
+		MinimumKHz: 0,
+		Devices: []DeviceClearance{
+			{ID: "a", MinimumKHz: 0, Limiter: "b"},
+			{ID: "b", MinimumKHz: 0, Limiter: "a"},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ComputeClearance = %+v; want %+v", got, want)
+	}
+}
+
+// Equal margins are resolved by the lexicographically smallest limiter
+// identifier, independent of evaluation order.
+func TestComputeClearanceTiesBreakByLimiterID(t *testing.T) {
+	cases := []struct {
+		name        string
+		fleet       []Device
+		wantID      string // device whose limiter is asserted
+		wantMinimum int64
+		wantLimiter string
+	}{
+		{
+			// Centered so both band margins are 111775: "band_high" < "band_low".
+			name: "band high wins tie against band low",
+			fleet: []Device{
+				{ID: "mic", Purpose: PurposeHandheld, CenterKHz: 582000, BandwidthKHz: 200}, // [581775, 582225]
+			},
+			wantID:      "mic",
+			wantMinimum: 111775,
+			wantLimiter: LimiterBandHigh,
+		},
+		{
+			// zebra: band_low 100 ties the 100-tick gap to alpha; "alpha" < "band_low".
+			name: "neighbor id wins tie against band low",
+			fleet: []Device{
+				{ID: "zebra", Purpose: PurposeHandheld, CenterKHz: 470325, BandwidthKHz: 200}, // [470100, 470550]
+				{ID: "alpha", Purpose: PurposeHandheld, CenterKHz: 470876, BandwidthKHz: 200}, // [470651, 471101]
+			},
+			wantID:      "zebra",
+			wantMinimum: 100,
+			wantLimiter: "alpha",
+		},
+		{
+			// Same 100/100 tie, but "zzz" sorts after "band_low".
+			name: "band low wins tie against later neighbor id",
+			fleet: []Device{
+				{ID: "mic", Purpose: PurposeHandheld, CenterKHz: 470325, BandwidthKHz: 200}, // [470100, 470550]
+				{ID: "zzz", Purpose: PurposeHandheld, CenterKHz: 470876, BandwidthKHz: 200}, // [470651, 471101]
+			},
+			wantID:      "mic",
+			wantMinimum: 100,
+			wantLimiter: LimiterBandLow,
+		},
+	}
+	for _, tc := range cases {
+		v := Adjudicate(tc.fleet)
+		if !v.Accepted {
+			t.Fatalf("%s: Accepted = false; want true, verdict %+v", tc.name, v)
+		}
+		got := ComputeClearance(v.Intervals)
+		var entry *DeviceClearance
+		for i := range got.Devices {
+			if got.Devices[i].ID == tc.wantID {
+				entry = &got.Devices[i]
+			}
+		}
+		if entry == nil {
+			t.Fatalf("%s: no clearance entry for %q in %+v", tc.name, tc.wantID, got)
+		}
+		if entry.MinimumKHz != tc.wantMinimum || entry.Limiter != tc.wantLimiter {
+			t.Errorf("%s: entry = %+v; want minimum %d limiter %q", tc.name, *entry, tc.wantMinimum, tc.wantLimiter)
+		}
+	}
+}
+
+// Intervals derived from int64-extreme centers saturate instead of wrapping:
+// margins stay well-ordered and never flip sign.
+func TestComputeClearanceExtremeIntervalsSaturate(t *testing.T) {
+	intervals := []DeviceInterval{
+		{ID: "extreme-lo", Interval: Interval{LowKHz: math.MinInt64, HighKHz: math.MinInt64 + 225}},
+		{ID: "normal", Interval: Interval{LowKHz: 499775, HighKHz: 500225}},
+	}
+	got := ComputeClearance(intervals)
+	if len(got.Devices) != 2 {
+		t.Fatalf("ComputeClearance.Devices = %+v; want 2 entries", got.Devices)
+	}
+	// Sorted by ID: extreme-lo first, normal second.
+	lo, normal := got.Devices[0], got.Devices[1]
+	if lo.ID != "extreme-lo" || lo.MinimumKHz != math.MinInt64 || lo.Limiter != LimiterBandLow {
+		t.Errorf("extreme-lo entry = %+v; want saturated MinInt64 via %q", lo, LimiterBandLow)
+	}
+	// The gap to the saturated neighbor saturates high, so the ordinary
+	// band margin still decides for the normal device.
+	if normal.ID != "normal" || normal.MinimumKHz != 29775 || normal.Limiter != LimiterBandLow {
+		t.Errorf("normal entry = %+v; want minimum 29775 via %q", normal, LimiterBandLow)
+	}
+	if got.MinimumKHz != math.MinInt64 {
+		t.Errorf("MinimumKHz = %d; want %d", got.MinimumKHz, int64(math.MinInt64))
+	}
+}

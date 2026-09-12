@@ -28,14 +28,38 @@
   （`first < second`），再按 `first`、`second` 升序去重输出。
 - 越界设备同样参与冲突检测，两类问题一次性全部报告。
 
+## 频率漂移净空（clearance）
+
+放行只是"当下不冲突"。协调员若想知道方案对频率漂移还有多少余量、哪台设备最脆弱，
+可在请求中带上可选开关 `include_clearance`（JSON 布尔值，省略、`null` 或 `false`
+均表示关闭）。**仅在 `accepted=true` 时**响应追加 `clearance` 字段；拒绝时仍只给出
+`out_of_band` 与 `conflicts`。开关关闭时响应逐字段与不加开关完全一致。
+
+净空以整数 kHz 计算，每台设备取下列候选中的最小值：
+
+| 候选 | 含义 | limiter 标识 |
+| --- | --- | --- |
+| 频段余量（下） | 保护区间到下端点的距离：`low_khz − 470000` | `"band_low"` |
+| 频段余量（上） | 保护区间到上端点的距离：`694000 − high_khz` | `"band_high"` |
+| 相邻余量 | 与频率相邻的左/右保护区间之间**未占用的整数刻度数**：`邻.low_khz − 本.high_khz − 1` | 邻居设备的 `id` |
+
+- 同值时按 limiter 标识的**字典序**取最小者（如 `"band_high" < "band_low"`，邻居编号按字符串比较）。
+- `clearance.minimum_khz` 为全部设备最小值中的最小值（全局最脆弱处）；
+  `clearance.devices` 按设备编号升序，每项含 `id`、`minimum_khz`、`limiter`。
+- 端点压线放行时余量为 0：保护区间贴频段端点，或与邻居仅隔 1 kHz（中间 0 个空闲刻度）。
+- 净空计算与区间计算一样使用饱和算术，极端中心频率不会回绕出颠倒的余量。
+- `include_clearance` 不是布尔值（如字符串、数字）时返回 400，
+  错误字段定位为 `include_clearance`，与设备级错误一并报告。
+
 ## API
 
 ### `POST /v1/coordinate`
 
-请求体：
+请求体（`include_clearance` 可选，默认关闭）：
 
 ```json
 {
+  "include_clearance": true,
   "devices": [
     {"id": "alpha", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200}
   ]
@@ -46,9 +70,9 @@
 
 | 情形 | HTTP | 正文 |
 | --- | --- | --- |
-| 放行 | 200 | `{"accepted": true, "devices": [{"id","low_khz","high_khz"}, ...]}` |
-| 越界 / 冲突 | 200 | `{"accepted": false, "out_of_band": [...], "conflicts": [{"first","second"}, ...]}` |
-| 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `devices[2].bandwidth_khz` |
+| 放行 | 200 | `{"accepted": true, "devices": [{"id","low_khz","high_khz"}, ...]}`；请求带 `include_clearance=true` 时追加 `"clearance": {"minimum_khz", "devices": [{"id","minimum_khz","limiter"}, ...]}` |
+| 越界 / 冲突 | 200 | `{"accepted": false, "out_of_band": [...], "conflicts": [{"first","second"}, ...]}`（即使请求了开关也不含 `clearance`） |
+| 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `devices[2].bandwidth_khz`、`include_clearance` |
 
 另提供 `GET /healthz` 用于健康检查。
 
@@ -127,6 +151,57 @@ $ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: applicat
 {"accepted":false,"errors":[{"field":"devices[0].purpose","message":"must be one of \"handheld\", \"bodypack\", \"ifb\""},{"field":"devices[0].bandwidth_khz","message":"must be between 25 and 400 kHz, got 401"}]}
 ```
 
+### 6. 净空：单设备受频段边界限制
+
+- `solo`：handheld，500000 / 200 → 保护区间 `[499775, 500225]`
+- 频段余量：下 `499775 − 470000 = 29775`，上 `694000 − 500225 = 193775`；无邻居
+- 最小值 29775 由 `band_low` 决定，全局最小值同为 29775
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: application/json' -d '{
+  "include_clearance": true,
+  "devices": [
+    {"id": "solo", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200}
+  ]
+}'
+{"accepted":true,"clearance":{"minimum_khz":29775,"devices":[{"id":"solo","minimum_khz":29775,"limiter":"band_low"}]},"devices":[{"id":"solo","low_khz":499775,"high_khz":500225}]}
+```
+
+### 7. 净空：乱序三设备由中间邻接间隙决定
+
+- `mic-a`：handheld，500000 / 200 → `[499775, 500225]`
+- `mic-b`：handheld，500500 / 200 → `[500275, 500725]`
+- `mic-c`：ifb，600000 / 201 → `[599650, 600351]`
+
+按频率排序为 a、b、c。相邻余量：a↔b 之间空闲刻度 `500275 − 500225 − 1 = 49`，
+b↔c 之间 `599650 − 500725 − 1 = 98924`。`mic-c` 的上频段余量 `694000 − 600351 = 93649`
+小于其相邻余量，故它由 `band_high` 限制；全局最小值 49 来自中间的 a↔b 间隙。
+提交顺序乱序（c、a、b）不影响结果，重复请求逐字节一致：
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: application/json' -d '{
+  "include_clearance": true,
+  "devices": [
+    {"id": "mic-c", "purpose": "ifb",      "center_khz": 600000, "bandwidth_khz": 201},
+    {"id": "mic-a", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200},
+    {"id": "mic-b", "purpose": "handheld", "center_khz": 500500, "bandwidth_khz": 200}
+  ]
+}'
+{"accepted":true,"clearance":{"minimum_khz":49,"devices":[{"id":"mic-a","minimum_khz":49,"limiter":"mic-b"},{"id":"mic-b","minimum_khz":49,"limiter":"mic-a"},{"id":"mic-c","minimum_khz":93649,"limiter":"band_high"}]},"devices":[{"id":"mic-a","low_khz":499775,"high_khz":500225},{"id":"mic-b","low_khz":500275,"high_khz":500725},{"id":"mic-c","low_khz":599650,"high_khz":600351}]}
+```
+
+### 8. 开关类型错误（HTTP 400）
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: application/json' -d '{
+  "include_clearance": "yes",
+  "devices": [
+    {"id": "solo", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200}
+  ]
+}'
+{"accepted":false,"errors":[{"field":"include_clearance","message":"must be a boolean, got \"yes\""}]}
+```
+
 ## 运行
 
 ### 本地（Go 1.25+）
@@ -143,7 +218,7 @@ $ docker compose up --build api                 # 默认宿主端口 8080
 $ API_PORT=9000 docker compose up --build api   # API_PORT 覆盖宿主端口
 ```
 
-一次性验收服务 `verify`：等待 API 就绪后执行 9 组端到端检查并逐条打印 PASS/FAIL，
+一次性验收服务 `verify`：等待 API 就绪后执行 15 组端到端检查并逐条打印 PASS/FAIL，
 任一失败则以非零码退出：
 
 ```console
@@ -158,9 +233,9 @@ $ docker compose up --build --exit-code-from verify verify
 ```
 cmd/server/main.go        # 服务入口（PORT，默认 8080）
 cmd/verify/main.go        # 一次性验收程序
-internal/rules/           # 纯领域规则：保护区间、越界、冲突、裁决
+internal/rules/           # 纯领域规则：保护区间、越界、冲突、裁决、漂移净空
 internal/rules/rules_test.go
-internal/api/             # Gin HTTP 层：请求校验、字段级错误、响应整形
+internal/api/             # Gin HTTP 层：请求校验、字段级错误、可选字段与响应整形
 internal/api/handler_test.go
 Dockerfile                # 多阶段构建，同一镜像提供 server 与 verify
 docker-compose.yml        # api（API_PORT 可覆盖宿主端口）+ verify（一次性）

@@ -121,6 +121,105 @@ type DeviceInterval struct {
 	Interval Interval
 }
 
+// Limiter identifiers for the band endpoints, used in DeviceClearance.Limiter
+// when the tightest constraint is a band edge rather than a neighbor device.
+const (
+	LimiterBandLow  = "band_low"
+	LimiterBandHigh = "band_high"
+)
+
+// DeviceClearance is the frequency-drift headroom of one device: the kHz
+// distance to the tightest constraint, and which constraint sets it.
+type DeviceClearance struct {
+	ID         string
+	MinimumKHz int64
+	Limiter    string // LimiterBandLow, LimiterBandHigh, or a neighbor's device ID
+}
+
+// Clearance is the drift headroom of a fleet: the global minimum plus one
+// entry per device, sorted by device ID.
+type Clearance struct {
+	MinimumKHz int64
+	Devices    []DeviceClearance
+}
+
+// clearanceCandidate is one constraint on one device: a margin in kHz and
+// the identifier of what sets it.
+type clearanceCandidate struct {
+	value   int64
+	limiter string
+}
+
+// tighterCandidate picks the candidate with the smaller margin; equal
+// margins go to the lexicographically smaller limiter identifier, so the
+// choice never depends on evaluation order.
+func tighterCandidate(a, b clearanceCandidate) clearanceCandidate {
+	if b.value < a.value || (b.value == a.value && b.limiter < a.limiter) {
+		return b
+	}
+	return a
+}
+
+// ComputeClearance measures how far the protected intervals can drift before
+// the verdict would change. It is meaningful for accepted fleets, where every
+// interval lies inside the band and no two overlap.
+//
+// The band margin of a device is the distance from its protected interval to
+// each band endpoint: low_khz - BandLowKHz and BandHighKHz - high_khz. The
+// neighbor margin is the number of unoccupied integer kHz ticks between two
+// adjacent protected intervals: right.LowKHz - high_khz - 1. Each device
+// reports the tightest of its candidates; ties go to the lexicographically
+// smallest limiter identifier ("band_high" < "band_low", neighbor IDs
+// compared as plain strings).
+//
+// All arithmetic saturates at the int64 limits, so even intervals derived
+// from extreme center frequencies yield well-ordered margins instead of
+// wrapping around.
+func ComputeClearance(intervals []DeviceInterval) Clearance {
+	byFreq := make([]DeviceInterval, len(intervals))
+	copy(byFreq, intervals)
+	sort.Slice(byFreq, func(i, j int) bool {
+		if byFreq[i].Interval.LowKHz != byFreq[j].Interval.LowKHz {
+			return byFreq[i].Interval.LowKHz < byFreq[j].Interval.LowKHz
+		}
+		return byFreq[i].ID < byFreq[j].ID
+	})
+
+	devices := make([]DeviceClearance, 0, len(byFreq))
+	for i, di := range byFreq {
+		iv := di.Interval
+		best := tighterCandidate(
+			clearanceCandidate{value: subSat(iv.LowKHz, BandLowKHz), limiter: LimiterBandLow},
+			clearanceCandidate{value: subSat(BandHighKHz, iv.HighKHz), limiter: LimiterBandHigh},
+		)
+		if i > 0 {
+			best = tighterCandidate(best, clearanceCandidate{
+				value:   subSat(subSat(iv.LowKHz, byFreq[i-1].Interval.HighKHz), 1),
+				limiter: byFreq[i-1].ID,
+			})
+		}
+		if i < len(byFreq)-1 {
+			best = tighterCandidate(best, clearanceCandidate{
+				value:   subSat(subSat(byFreq[i+1].Interval.LowKHz, iv.HighKHz), 1),
+				limiter: byFreq[i+1].ID,
+			})
+		}
+		devices = append(devices, DeviceClearance{ID: di.ID, MinimumKHz: best.value, Limiter: best.limiter})
+	}
+	sort.Slice(devices, func(i, j int) bool { return devices[i].ID < devices[j].ID })
+
+	clearance := Clearance{Devices: devices}
+	if len(devices) > 0 {
+		clearance.MinimumKHz = devices[0].MinimumKHz
+		for _, d := range devices[1:] {
+			if d.MinimumKHz < clearance.MinimumKHz {
+				clearance.MinimumKHz = d.MinimumKHz
+			}
+		}
+	}
+	return clearance
+}
+
 // ConflictPair is an unordered pair of conflicting device IDs, normalized
 // so that First < Second in lexicographic order.
 type ConflictPair struct {

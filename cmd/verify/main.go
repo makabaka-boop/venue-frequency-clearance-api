@@ -39,6 +39,11 @@ func main() {
 		{"validation errors locate fields", checkValidationErrors},
 		{"fleet size limits", checkFleetSizeLimits},
 		{"verdict is stable across repeats", checkStable},
+		{"clearance: single device limited by band edge", checkClearanceSingleDevice},
+		{"clearance: middle gap of shuffled trio decides, stable", checkClearanceMiddleGap},
+		{"clearance omitted on rejection even when requested", checkClearanceOmittedOnRejection},
+		{"omitted/false include_clearance keeps legacy bytes", checkClearanceSwitchCompatible},
+		{"include_clearance type error is a locatable 400", checkClearanceSwitchTypeError},
 	}
 
 	failures := 0
@@ -77,11 +82,23 @@ type conflictPair struct {
 	Second string `json:"second"`
 }
 
+type deviceClearance struct {
+	ID         string `json:"id"`
+	MinimumKHz int64  `json:"minimum_khz"`
+	Limiter    string `json:"limiter"`
+}
+
+type clearanceBlock struct {
+	MinimumKHz int64             `json:"minimum_khz"`
+	Devices    []deviceClearance `json:"devices"`
+}
+
 type verdictResp struct {
 	Accepted  bool             `json:"accepted"`
 	Devices   []deviceInterval `json:"devices"`
 	OutOfBand []deviceInterval `json:"out_of_band"`
 	Conflicts []conflictPair   `json:"conflicts"`
+	Clearance *clearanceBlock  `json:"clearance"`
 }
 
 type errorResp struct {
@@ -410,6 +427,206 @@ func checkStable(base string) error {
 		return fmt.Errorf("repeated identical requests differ:\n%s\n%s", first, second)
 	}
 	return nil
+}
+
+func checkClearanceSingleDevice(base string) error {
+	// solo: handheld, 500000/200 -> protected [499775, 500225].
+	// band_low margin 499775-470000 = 29775 beats band_high 694000-500225 = 193775.
+	status, raw, err := post(base, map[string]any{
+		"include_clearance": true,
+		"devices": []deviceReq{
+			{ID: "solo", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status = %d, body = %s", status, raw)
+	}
+	var v verdictResp
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return err
+	}
+	if !v.Accepted {
+		return fmt.Errorf("accepted = false, body = %s", raw)
+	}
+	if v.Clearance == nil {
+		return fmt.Errorf("clearance missing from accepted response, body = %s", raw)
+	}
+	want := clearanceBlock{
+		MinimumKHz: 29775,
+		Devices:    []deviceClearance{{ID: "solo", MinimumKHz: 29775, Limiter: "band_low"}},
+	}
+	if !reflect.DeepEqual(*v.Clearance, want) {
+		return fmt.Errorf("clearance = %+v, want %+v", *v.Clearance, want)
+	}
+	return nil
+}
+
+func checkClearanceMiddleGap(base string) error {
+	// mic-a [499775,500225], mic-b [500275,500725], mic-c [599650,600351].
+	// The a<->b gap is 500275-500225-1 = 49 unoccupied ticks, tighter than
+	// every band margin; c is limited by band_high 694000-600351 = 93649.
+	body := map[string]any{
+		"include_clearance": true,
+		"devices": []deviceReq{
+			{ID: "mic-c", Purpose: "ifb", CenterKHz: 600000, BandwidthKHz: 201},
+			{ID: "mic-a", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+			{ID: "mic-b", Purpose: "handheld", CenterKHz: 500500, BandwidthKHz: 200},
+		},
+	}
+	status, raw, err := post(base, body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status = %d, body = %s", status, raw)
+	}
+	var v verdictResp
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return err
+	}
+	if !v.Accepted {
+		return fmt.Errorf("accepted = false, body = %s", raw)
+	}
+	if v.Clearance == nil {
+		return fmt.Errorf("clearance missing from accepted response, body = %s", raw)
+	}
+	want := clearanceBlock{
+		MinimumKHz: 49,
+		Devices: []deviceClearance{
+			{ID: "mic-a", MinimumKHz: 49, Limiter: "mic-b"},
+			{ID: "mic-b", MinimumKHz: 49, Limiter: "mic-a"},
+			{ID: "mic-c", MinimumKHz: 93649, Limiter: "band_high"},
+		},
+	}
+	if !reflect.DeepEqual(*v.Clearance, want) {
+		return fmt.Errorf("clearance = %+v, want %+v", *v.Clearance, want)
+	}
+
+	// The same request again, and the same fleet submitted in a different
+	// order, must produce byte-identical responses.
+	_, repeat, err := post(base, body)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(raw, repeat) {
+		return fmt.Errorf("repeated request differs:\n%s\n%s", raw, repeat)
+	}
+	reordered := map[string]any{
+		"include_clearance": true,
+		"devices": []deviceReq{
+			{ID: "mic-b", Purpose: "handheld", CenterKHz: 500500, BandwidthKHz: 200},
+			{ID: "mic-c", Purpose: "ifb", CenterKHz: 600000, BandwidthKHz: 201},
+			{ID: "mic-a", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+		},
+	}
+	_, shuffled, err := post(base, reordered)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(raw, shuffled) {
+		return fmt.Errorf("reordered fleet differs:\n%s\n%s", raw, shuffled)
+	}
+	return nil
+}
+
+func checkClearanceOmittedOnRejection(base string) error {
+	// Touching protected intervals: rejected; clearance must not appear
+	// even though it was requested.
+	status, raw, err := post(base, map[string]any{
+		"include_clearance": true,
+		"devices": []deviceReq{
+			{ID: "b", Purpose: "handheld", CenterKHz: 500450, BandwidthKHz: 200},
+			{ID: "a", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status = %d, body = %s", status, raw)
+	}
+	var v verdictResp
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return err
+	}
+	if v.Accepted {
+		return fmt.Errorf("accepted = true, want false, body = %s", raw)
+	}
+	if v.Clearance != nil || bytes.Contains(raw, []byte(`"clearance"`)) {
+		return fmt.Errorf("rejected response carries clearance, body = %s", raw)
+	}
+	if len(v.Conflicts) != 1 {
+		return fmt.Errorf("conflicts = %+v, want 1 pair", v.Conflicts)
+	}
+	return nil
+}
+
+func checkClearanceSwitchCompatible(base string) error {
+	// Omitting the switch, or setting it to false or null, must leave the
+	// legacy response byte-for-byte unchanged, accepted or rejected.
+	fleets := []map[string]any{
+		{"devices": []deviceReq{
+			{ID: "solo", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+		}},
+		{"devices": []deviceReq{
+			{ID: "b", Purpose: "handheld", CenterKHz: 500450, BandwidthKHz: 200},
+			{ID: "a", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+		}},
+	}
+	for i, fleet := range fleets {
+		status, legacy, err := post(base, fleet)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("fleet %d: status = %d, body = %s", i, status, legacy)
+		}
+		if bytes.Contains(legacy, []byte(`"clearance"`)) {
+			return fmt.Errorf("fleet %d: response without the switch contains clearance: %s", i, legacy)
+		}
+		for _, value := range []any{false, nil} {
+			withSwitch := map[string]any{"devices": fleet["devices"], "include_clearance": value}
+			vStatus, vRaw, err := post(base, withSwitch)
+			if err != nil {
+				return err
+			}
+			if vStatus != status {
+				return fmt.Errorf("fleet %d, switch %v: status = %d, want %d", i, value, vStatus, status)
+			}
+			if !bytes.Equal(legacy, vRaw) {
+				return fmt.Errorf("fleet %d, switch %v: response = %s, want byte-identical to %s", i, value, vRaw, legacy)
+			}
+		}
+	}
+	return nil
+}
+
+func checkClearanceSwitchTypeError(base string) error {
+	status, raw, err := post(base, map[string]any{
+		"include_clearance": "yes",
+		"devices": []deviceReq{
+			{ID: "solo", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusBadRequest {
+		return fmt.Errorf("status = %d, want 400, body = %s", status, raw)
+	}
+	var e errorResp
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return err
+	}
+	for _, fe := range e.Errors {
+		if fe.Field == "include_clearance" {
+			return nil
+		}
+	}
+	return fmt.Errorf("no error locating include_clearance, body = %s", raw)
 }
 
 // --- helpers ---

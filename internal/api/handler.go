@@ -27,6 +27,9 @@ type deviceInput struct {
 
 type coordinateRequest struct {
 	Devices []deviceInput `json:"devices"`
+	// IncludeClearance stays raw so a non-boolean value can be reported
+	// against the field instead of failing the whole decode.
+	IncludeClearance json.RawMessage `json:"include_clearance"`
 }
 
 // fieldError locates one validation problem, e.g. "devices[2].bandwidth_khz".
@@ -44,6 +47,20 @@ type deviceIntervalJSON struct {
 type conflictPairJSON struct {
 	First  string `json:"first"`
 	Second string `json:"second"`
+}
+
+// clearanceJSON is the optional drift-headroom block, present only on
+// accepted responses that asked for it. Struct field order fixes the key
+// order in the emitted JSON.
+type clearanceJSON struct {
+	MinimumKHz int64                 `json:"minimum_khz"`
+	Devices    []deviceClearanceJSON `json:"devices"`
+}
+
+type deviceClearanceJSON struct {
+	ID         string `json:"id"`
+	MinimumKHz int64  `json:"minimum_khz"`
+	Limiter    string `json:"limiter"`
 }
 
 // NewRouter builds the Gin engine with all routes.
@@ -76,7 +93,7 @@ func handleCoordinate(c *gin.Context) {
 		return
 	}
 
-	devices, errs := validateRequest(req)
+	devices, includeClearance, errs := validateRequest(req)
 	if len(errs) > 0 {
 		writeErrors(c, http.StatusBadRequest, errs...)
 		return
@@ -84,12 +101,18 @@ func handleCoordinate(c *gin.Context) {
 
 	verdict := rules.Adjudicate(devices)
 	if verdict.Accepted {
-		c.JSON(http.StatusOK, gin.H{
+		resp := gin.H{
 			"accepted": true,
 			"devices":  toDeviceIntervalsJSON(verdict.Intervals),
-		})
+		}
+		if includeClearance {
+			resp["clearance"] = toClearanceJSON(rules.ComputeClearance(verdict.Intervals))
+		}
+		c.JSON(http.StatusOK, resp)
 		return
 	}
+	// Rejected fleets report only out-of-band and conflict details, even
+	// when clearance was requested.
 	c.JSON(http.StatusOK, gin.H{
 		"accepted":    false,
 		"out_of_band": toDeviceIntervalsJSON(verdict.OutOfBand),
@@ -99,13 +122,21 @@ func handleCoordinate(c *gin.Context) {
 
 // validateRequest checks the fleet and every device field, collecting one
 // error per problem so the coordinator can fix everything in one pass.
-func validateRequest(req coordinateRequest) ([]rules.Device, []fieldError) {
+func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError) {
 	var errs []fieldError
+
+	includeClearance, ok := parseIncludeClearance(req.IncludeClearance)
+	if !ok {
+		errs = append(errs, fieldError{
+			Field:   "include_clearance",
+			Message: fmt.Sprintf("must be a boolean, got %s", string(req.IncludeClearance)),
+		})
+	}
 
 	switch {
 	case req.Devices == nil:
 		errs = append(errs, fieldError{Field: "devices", Message: "is required"})
-		return nil, errs
+		return nil, includeClearance, errs
 	case len(req.Devices) < rules.MinDevices || len(req.Devices) > rules.MaxDevices:
 		errs = append(errs, fieldError{
 			Field:   "devices",
@@ -158,7 +189,19 @@ func validateRequest(req coordinateRequest) ([]rules.Device, []fieldError) {
 			BandwidthKHz: bw,
 		})
 	}
-	return devices, errs
+	return devices, includeClearance, errs
+}
+
+// parseIncludeClearance reads the optional include_clearance switch. Absent
+// or null means false; anything but a JSON boolean is a type error.
+func parseIncludeClearance(raw json.RawMessage) (value, ok bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false, true
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, false
+	}
+	return value, true
 }
 
 // parseKHz converts a JSON number to an integer kHz value.
@@ -200,6 +243,21 @@ func toConflictsJSON(pairs []rules.ConflictPair) []conflictPairJSON {
 	out := make([]conflictPairJSON, 0, len(pairs))
 	for _, p := range pairs {
 		out = append(out, conflictPairJSON{First: p.First, Second: p.Second})
+	}
+	return out
+}
+
+func toClearanceJSON(cl rules.Clearance) clearanceJSON {
+	out := clearanceJSON{
+		MinimumKHz: cl.MinimumKHz,
+		Devices:    make([]deviceClearanceJSON, 0, len(cl.Devices)),
+	}
+	for _, d := range cl.Devices {
+		out.Devices = append(out.Devices, deviceClearanceJSON{
+			ID:         d.ID,
+			MinimumKHz: d.MinimumKHz,
+			Limiter:    d.Limiter,
+		})
 	}
 	return out
 }
