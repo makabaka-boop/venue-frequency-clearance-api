@@ -91,6 +91,31 @@ MHz 模式下下列情况返回定位到设备属性的 400（与其他设备级
 `frequency_unit` 本身取值未知（`"ghz"`、大小写不符的 `"MHz"`、显式 `"khz"` 等）、类型错误
 （`null`、数字、布尔等），或在同一对象内重复出现时，在裁决前以定位 `frequency_unit` 的 400 拒绝。
 
+## 试算调谐（`check-retunes`）
+
+协调员拿到冲突结论后，往往已有若干备选中心频率，希望在改动设备清单前一次判断哪个调谐值能
+恢复放行。`POST /v1/check-retunes` 接收现有 `devices`、唯一的 `target_id` 和 1 至 50 个
+`candidate_centers_khz`，把每个候选**替换目标设备的中心频率**后交给既有区间裁决——
+其余设备以及目标设备的带宽、用途均不改动。
+
+- `devices` 与 `frequency_unit` 的解析、校验和 `/v1/coordinate` 完全一致；候选中心频率复用
+  同一套整数 kHz / MHz 定点解析，响应一律输出 kHz。
+- 结果按**换算后的中心频率升序**返回，每项含 `center_khz`、`accepted`；被拒绝的候选追加该次
+  试算**完整的** `out_of_band` 与 `conflicts`（结构与协调接口的拒绝响应相同）。
+  候选顺序、设备顺序不影响输出，重复提交逐字节一致。
+- 合法候选导致保护区间越界属于**试算结论**（200，`accepted:false` 并携带越界明细），
+  不作为请求错误。
+
+下列情况返回定位到字段的 400（与设备级错误一并报告）：
+
+| 问题 | 定位字段 |
+| --- | --- |
+| `target_id` 缺失、不是字符串、为空或不存在于设备清单 | `target_id` |
+| 候选数组缺失、为空或超过 50 个 | `candidate_centers_khz` |
+| 候选数值精度非法（kHz 非整数、MHz 超三位小数、指数记法）或换算超出 int64 | `candidate_centers_khz[i]` |
+| 候选归一化（换算成 kHz）后重复（如 MHz 下 `500` 与 `500.000`） | `candidate_centers_khz[j]`（后一次出现） |
+| 同一对象内重复键（两个 `target_id`、两份候选数组等） | 重复字段本身 |
+
 ## API
 
 ### `POST /v1/coordinate`
@@ -114,6 +139,28 @@ MHz 模式下下列情况返回定位到设备属性的 400（与其他设备级
 | 放行 | 200 | `{"accepted": true, "devices": [{"id","low_khz","high_khz"}, ...]}`；请求带 `include_clearance=true` 时追加 `"clearance": {"minimum_khz", "devices": [{"id","minimum_khz","limiter"}, ...]}` |
 | 越界 / 冲突 | 200 | `{"accepted": false, "out_of_band": [...], "conflicts": [{"first","second"}, ...]}`（即使请求了开关也不含 `clearance`） |
 | 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `devices[2].bandwidth_khz`、`include_clearance`、`frequency_unit`；同一 JSON 对象内重复键（如两份 `devices`、两个 `include_clearance`、设备内两个 `center_khz`、两个 `frequency_unit`）同样 400，定位到重复字段 |
+
+### `POST /v1/check-retunes`
+
+请求体（`frequency_unit` 可选，语义同 `/v1/coordinate`）：
+
+```json
+{
+  "devices": [
+    {"id": "other",  "purpose": "handheld", "center_khz": 500450, "bandwidth_khz": 200},
+    {"id": "target", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200}
+  ],
+  "target_id": "target",
+  "candidate_centers_khz": [500450, 499000, 500000]
+}
+```
+
+响应：
+
+| 情形 | HTTP | 正文 |
+| --- | --- | --- |
+| 试算完成 | 200 | `{"results": [{"center_khz","accepted"}, ...]}`，按换算后中心频率升序；被拒绝的候选追加 `"out_of_band": [...]`、`"conflicts": [...]` |
+| 输入非法 | 400 | `{"accepted": false, "errors": [{"field","message"}, ...]}`，字段定位如 `target_id`、`candidate_centers_khz[2]` |
 
 另提供 `GET /healthz` 用于健康检查。
 
@@ -297,6 +344,31 @@ $ curl -s -X POST http://localhost:8080/v1/coordinate -H 'Content-Type: applicat
 `frequency_unit`，都在裁决前以定位 `frequency_unit` 的 400 拒绝。不带 `frequency_unit` 时，
 整数 kHz 的既有成功与拒绝响应逐字节不变。
 
+### 11. 试算调谐：一个候选解除目标冲突
+
+- `other`：handheld，500450 / 200 → 保护区间 `[500225, 500675]`
+- `target`：handheld，500000 / 200 → 保护区间 `[499775, 500225]`，与 `other` 端点相触 → 冲突
+- 候选 `499000` → `[498775, 499225]`，与 `other` 不再相交 → 放行；
+  候选 `500450` 与 `other` 同频 → 冲突
+
+```console
+$ curl -s -X POST http://localhost:8080/v1/check-retunes -H 'Content-Type: application/json' -d '{
+  "devices": [
+    {"id": "other",  "purpose": "handheld", "center_khz": 500450, "bandwidth_khz": 200},
+    {"id": "target", "purpose": "handheld", "center_khz": 500000, "bandwidth_khz": 200}
+  ],
+  "target_id": "target",
+  "candidate_centers_khz": [500450, 499000, 500000]
+}'
+{"results":[{"center_khz":499000,"accepted":true},{"center_khz":500000,"accepted":false,"out_of_band":[],"conflicts":[{"first":"other","second":"target"}]},{"center_khz":500450,"accepted":false,"out_of_band":[],"conflicts":[{"first":"other","second":"target"}]}]}
+```
+
+候选乱序提交、设备乱序提交，输出都逐字节不变；`"frequency_unit":"mhz"` 下候选写
+`500.450`、`499.000`、`500.000` 时响应与本例逐字节一致。目标编号不存在、候选数组为空、
+候选精度非法或归一化后重复（如 MHz 下 `500` 与 `500.000`）均返回定位到字段的 400；
+而候选 `470000` 这类合法数值导致保护区间越界时，结论体现在该候选的
+`accepted:false` 与 `out_of_band` 明细中，请求本身仍是 200。
+
 ## 运行
 
 ### 本地（Go 1.25+）
@@ -313,7 +385,7 @@ $ docker compose up --build api                 # 默认宿主端口 8080
 $ API_PORT=9000 docker compose up --build api   # API_PORT 覆盖宿主端口
 ```
 
-一次性验收服务 `verify`：等待 API 就绪后执行 21 组端到端检查并逐条打印 PASS/FAIL，
+一次性验收服务 `verify`：等待 API 就绪后执行 26 组端到端检查并逐条打印 PASS/FAIL，
 任一失败则以非零码退出：
 
 ```console

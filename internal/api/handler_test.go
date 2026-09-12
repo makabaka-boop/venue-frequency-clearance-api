@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -812,5 +813,257 @@ func TestCoordinateLegacyKHzBytesUnchanged(t *testing.T) {
 	status, raw = postBodyRaw(t, bad)
 	if status != http.StatusBadRequest || string(raw) != `{"accepted":false,"errors":[{"field":"devices[0].center_khz","message":"must be an integer number of kHz, got 500000.5"}]}` {
 		t.Errorf("legacy 400 body changed: %d %s", status, raw)
+	}
+}
+
+// --- POST /v1/check-retunes ---
+
+func postRetunesRaw(t *testing.T, body string) (int, []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/check-retunes", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, req)
+	return rec.Code, rec.Body.Bytes()
+}
+
+func postRetunes(t *testing.T, body string) (int, map[string]any) {
+	t.Helper()
+	status, raw := postRetunesRaw(t, body)
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("response is not JSON: %v\nbody: %s", err, raw)
+	}
+	return status, decoded
+}
+
+// other protects [500225, 500675]; the target currently touches it at 500225.
+// Only candidate 499000 moves the target clear. Candidates are submitted out
+// of order; the response is sorted by center frequency and byte-stable.
+func TestCheckRetunesShuffledCandidatesStable(t *testing.T) {
+	body := `{"devices":[
+		{"id":"other","purpose":"handheld","center_khz":500450,"bandwidth_khz":200},
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[500450,499000,500000]}`
+	status, raw := postRetunesRaw(t, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d; want 200, body = %s", status, raw)
+	}
+	want := `{"results":[` +
+		`{"center_khz":499000,"accepted":true},` +
+		`{"center_khz":500000,"accepted":false,"out_of_band":[],"conflicts":[{"first":"other","second":"target"}]},` +
+		`{"center_khz":500450,"accepted":false,"out_of_band":[],"conflicts":[{"first":"other","second":"target"}]}` +
+		`]}`
+	if string(raw) != want {
+		t.Errorf("body = %s; want %s", raw, want)
+	}
+
+	// Repeating the request, and submitting the same candidates in a
+	// different order, must yield byte-identical responses.
+	_, repeat := postRetunesRaw(t, body)
+	if !bytes.Equal(raw, repeat) {
+		t.Errorf("repeated request differs:\n%s\n%s", raw, repeat)
+	}
+	shuffled := `{"devices":[
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+		{"id":"other","purpose":"handheld","center_khz":500450,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[500000,500450,499000]}`
+	_, reordered := postRetunesRaw(t, shuffled)
+	if !bytes.Equal(raw, reordered) {
+		t.Errorf("reordered candidates differ:\n%s\n%s", raw, reordered)
+	}
+}
+
+// A conflict the target is not part of blocks every candidate: each trial is
+// rejected and names the unrelated pair.
+func TestCheckRetunesUnrelatedConflictBlocksAll(t *testing.T) {
+	body := `{"devices":[
+		{"id":"b","purpose":"handheld","center_khz":600100,"bandwidth_khz":200},
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+		{"id":"a","purpose":"handheld","center_khz":600000,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[501000,500000]}`
+	status, raw := postRetunesRaw(t, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d; want 200, body = %s", status, raw)
+	}
+	want := `{"results":[` +
+		`{"center_khz":500000,"accepted":false,"out_of_band":[],"conflicts":[{"first":"a","second":"b"}]},` +
+		`{"center_khz":501000,"accepted":false,"out_of_band":[],"conflicts":[{"first":"a","second":"b"}]}` +
+		`]}`
+	if string(raw) != want {
+		t.Errorf("body = %s; want %s", raw, want)
+	}
+}
+
+// A legal candidate that pushes the target's protected interval out of the
+// band is a trial verdict (200, accepted=false with the out-of-band detail),
+// not a request error.
+func TestCheckRetunesOutOfBandCandidateIsTrialVerdict(t *testing.T) {
+	body := `{"devices":[
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[470000,500000]}`
+	status, raw := postRetunesRaw(t, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d; want 200, body = %s", status, raw)
+	}
+	want := `{"results":[` +
+		`{"center_khz":470000,"accepted":false,"out_of_band":[{"id":"target","low_khz":469775,"high_khz":470225}],"conflicts":[]},` +
+		`{"center_khz":500000,"accepted":true}` +
+		`]}`
+	if string(raw) != want {
+		t.Errorf("body = %s; want %s", raw, want)
+	}
+}
+
+// MHz candidates and device numbers are converted to integer kHz before the
+// trials run: the response is byte-identical to the equivalent kHz request.
+func TestCheckRetunesMHzMatchesKHz(t *testing.T) {
+	mhzBody := `{"frequency_unit":"mhz","devices":[
+		{"id":"other","purpose":"handheld","center_khz":500.450,"bandwidth_khz":0.200},
+		{"id":"target","purpose":"handheld","center_khz":500.000,"bandwidth_khz":0.200}
+	],"target_id":"target","candidate_centers_khz":[500.450,499.000,500.000]}`
+	khzBody := `{"devices":[
+		{"id":"other","purpose":"handheld","center_khz":500450,"bandwidth_khz":200},
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[500450,499000,500000]}`
+	status, mhzRaw := postRetunesRaw(t, mhzBody)
+	if status != http.StatusOK {
+		t.Fatalf("mhz: status = %d; want 200, body = %s", status, mhzRaw)
+	}
+	status, khzRaw := postRetunesRaw(t, khzBody)
+	if status != http.StatusOK {
+		t.Fatalf("khz: status = %d; want 200, body = %s", status, khzRaw)
+	}
+	if !bytes.Equal(mhzRaw, khzRaw) {
+		t.Errorf("MHz and kHz trial responses differ:\n%s\n%s", mhzRaw, khzRaw)
+	}
+}
+
+// Every malformed request element is a locatable 400; device-level problems
+// in the same body are still reported alongside.
+func TestCheckRetunesValidationErrorsLocateFields(t *testing.T) {
+	fleet := `[{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]`
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"missing target_id", `{"devices":` + fleet + `,"candidate_centers_khz":[500000]}`, "target_id"},
+		{"null target_id", `{"devices":` + fleet + `,"target_id":null,"candidate_centers_khz":[500000]}`, "target_id"},
+		{"numeric target_id", `{"devices":` + fleet + `,"target_id":7,"candidate_centers_khz":[500000]}`, "target_id"},
+		{"empty target_id", `{"devices":` + fleet + `,"target_id":"","candidate_centers_khz":[500000]}`, "target_id"},
+		{"unknown target_id", `{"devices":` + fleet + `,"target_id":"ghost","candidate_centers_khz":[500000]}`, "target_id"},
+		{"missing candidates", `{"devices":` + fleet + `,"target_id":"target"}`, "candidate_centers_khz"},
+		{"empty candidates", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[]}`, "candidate_centers_khz"},
+		{"fractional kHz candidate", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[500000.5]}`, "candidate_centers_khz[0]"},
+		{"candidate beyond int64", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[99999999999999999999999]}`, "candidate_centers_khz[0]"},
+		{"duplicate candidates", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[499000,500000,499000]}`, "candidate_centers_khz[2]"},
+		{"mhz candidate with four decimals", `{"frequency_unit":"mhz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[500.0001]}`, "candidate_centers_khz[0]"},
+		{"mhz candidate beyond int64 kHz", `{"frequency_unit":"mhz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[9223372036854775.808]}`, "candidate_centers_khz[0]"},
+		{"mhz candidates normalize to the same kHz", `{"frequency_unit":"mhz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[500,500.000]}`, "candidate_centers_khz[1]"},
+		{"unknown frequency_unit", `{"frequency_unit":"khz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[500000]}`, "frequency_unit"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, resp := postRetunes(t, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+			}
+			if resp["accepted"] != false {
+				t.Errorf("accepted = %v; want false", resp["accepted"])
+			}
+			errs, ok := resp["errors"].([]any)
+			if !ok || len(errs) == 0 {
+				t.Fatalf("errors = %v; want a non-empty list", resp["errors"])
+			}
+			got := make(map[string]bool, len(errs))
+			for _, e := range errs {
+				got[e.(map[string]any)["field"].(string)] = true
+			}
+			if !got[tc.field] {
+				t.Errorf("missing error for field %q; got fields %v", tc.field, got)
+			}
+		})
+	}
+
+	// 51 candidates exceed the per-request limit.
+	many := make([]string, 0, 51)
+	for i := 0; i < 51; i++ {
+		many = append(many, fmt.Sprintf("%d", 470137+i*1120))
+	}
+	body := `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[` + strings.Join(many, ",") + `]}`
+	status, resp := postRetunes(t, body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("51 candidates: status = %d; want 400, resp = %v", status, resp)
+	}
+	errs := resp["errors"].([]any)
+	if errs[0].(map[string]any)["field"] != "candidate_centers_khz" {
+		t.Errorf("51 candidates: error field = %v; want candidate_centers_khz", errs[0])
+	}
+
+	// A device-level problem is reported alongside a candidate problem.
+	status, resp = postRetunes(t, `{"devices":[{"id":"target","purpose":"lavalier","center_khz":500000,"bandwidth_khz":200}],"target_id":"target","candidate_centers_khz":[500000.5]}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("mixed errors: status = %d; want 400, resp = %v", status, resp)
+	}
+	got := map[string]bool{}
+	for _, e := range resp["errors"].([]any) {
+		got[e.(map[string]any)["field"].(string)] = true
+	}
+	for _, want := range []string{"devices[0].purpose", "candidate_centers_khz[0]"} {
+		if !got[want] {
+			t.Errorf("mixed errors: missing error for %q; got fields %v", want, got)
+		}
+	}
+}
+
+// Duplicated object keys in a retune request are rejected by the same scan
+// as coordinate: two target selectors or two candidate lists are ambiguous.
+func TestCheckRetunesDuplicateKeys(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{
+			name: "two target selectors",
+			body: `{"devices":[{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}],` +
+				`"target_id":"target","target_id":"target","candidate_centers_khz":[500000]}`,
+			field: "target_id",
+		},
+		{
+			name: "two candidate lists",
+			body: `{"devices":[{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}],` +
+				`"target_id":"target","candidate_centers_khz":[500000],"candidate_centers_khz":[500100]}`,
+			field: "candidate_centers_khz",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, resp := postRetunes(t, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+			}
+			errs, ok := resp["errors"].([]any)
+			if !ok || len(errs) == 0 {
+				t.Fatalf("errors = %v; want a non-empty list", resp["errors"])
+			}
+			if errs[0].(map[string]any)["field"] != tc.field {
+				t.Errorf("error field = %v; want %q", errs[0], tc.field)
+			}
+		})
+	}
+}
+
+// The retune endpoint shares the coordinate request pipeline: malformed JSON
+// and unknown fields are 400s, and include_clearance is not a retune field.
+func TestCheckRetunesRequestShapeErrors(t *testing.T) {
+	status, _ := postRetunesRaw(t, `{"devices": [`)
+	if status != http.StatusBadRequest {
+		t.Errorf("malformed JSON: status = %d; want 400", status)
+	}
+	status, resp := postRetunes(t, `{"devices":[{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}],"target_id":"target","candidate_centers_khz":[500000],"include_clearance":true}`)
+	if status != http.StatusBadRequest {
+		t.Errorf("unknown field include_clearance: status = %d; want 400, resp = %v", status, resp)
 	}
 }

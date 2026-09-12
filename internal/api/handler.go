@@ -37,6 +37,18 @@ type coordinateRequest struct {
 	FrequencyUnit json.RawMessage `json:"frequency_unit"`
 }
 
+// checkRetunesRequest is the wire form of a retune trial: the existing fleet,
+// the one device to retune, and the candidate center frequencies to try.
+type checkRetunesRequest struct {
+	Devices []deviceInput `json:"devices"`
+	// TargetID stays raw so a non-string value can be reported against the
+	// field instead of failing the whole decode.
+	TargetID            json.RawMessage `json:"target_id"`
+	CandidateCentersKHz []json.Number   `json:"candidate_centers_khz"`
+	// FrequencyUnit behaves exactly as in coordinateRequest.
+	FrequencyUnit json.RawMessage `json:"frequency_unit"`
+}
+
 // FrequencyUnitMHz is the only accepted frequency_unit value. With it set,
 // center_khz / bandwidth_khz carry MHz numbers with up to three decimal
 // places, which the HTTP layer converts to integer kHz before adjudication.
@@ -57,6 +69,18 @@ type deviceIntervalJSON struct {
 type conflictPairJSON struct {
 	First  string `json:"first"`
 	Second string `json:"second"`
+}
+
+// retuneResultJSON is the wire form of one retune trial. OutOfBand and
+// Conflicts are present only on rejected trials, mirroring the coordinate
+// rejection shape; pointers keep the keys off accepted trials while still
+// emitting "[]" for an empty list on rejected ones. Struct field order fixes
+// the key order in the emitted JSON.
+type retuneResultJSON struct {
+	CenterKHz int64                 `json:"center_khz"`
+	Accepted  bool                  `json:"accepted"`
+	OutOfBand *[]deviceIntervalJSON `json:"out_of_band,omitempty"`
+	Conflicts *[]conflictPairJSON   `json:"conflicts,omitempty"`
 }
 
 // clearanceJSON is the optional drift-headroom block, present only on
@@ -81,11 +105,14 @@ func NewRouter() *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	r.POST("/v1/coordinate", handleCoordinate)
+	r.POST("/v1/check-retunes", handleCheckRetunes)
 	return r
 }
 
-func handleCoordinate(c *gin.Context) {
-	var req coordinateRequest
+// decodeRequestBody reads the capped body, decodes the single JSON object it
+// must contain into req, and rejects duplicated object keys. ok is false when
+// an error response has already been written.
+func decodeRequestBody(c *gin.Context, req any) bool {
 	limited := http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
 	raw, err := io.ReadAll(limited)
 	if err != nil {
@@ -93,23 +120,23 @@ func handleCoordinate(c *gin.Context) {
 			Field:   "",
 			Message: "invalid JSON body: " + err.Error(),
 		})
-		return
+		return false
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := dec.Decode(req); err != nil {
 		writeErrors(c, http.StatusBadRequest, fieldError{
 			Field:   "",
 			Message: "invalid JSON body: " + err.Error(),
 		})
-		return
+		return false
 	}
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		writeErrors(c, http.StatusBadRequest, fieldError{
 			Field:   "",
 			Message: "body must contain a single JSON object",
 		})
-		return
+		return false
 	}
 
 	// Reject duplicated object keys outright: encoding/json would otherwise
@@ -118,6 +145,14 @@ func handleCoordinate(c *gin.Context) {
 	// errors, reported before semantic validation.
 	if dupErrs := duplicateKeyErrors(raw); len(dupErrs) > 0 {
 		writeErrors(c, http.StatusBadRequest, dupErrs...)
+		return false
+	}
+	return true
+}
+
+func handleCoordinate(c *gin.Context) {
+	var req coordinateRequest
+	if !decodeRequestBody(c, &req) {
 		return
 	}
 
@@ -148,6 +183,143 @@ func handleCoordinate(c *gin.Context) {
 	})
 }
 
+// handleCheckRetunes tries each candidate center frequency on the target
+// device and reports one trial verdict per candidate, so the coordinator can
+// pick a retune value before touching the device list.
+func handleCheckRetunes(c *gin.Context) {
+	var req checkRetunesRequest
+	if !decodeRequestBody(c, &req) {
+		return
+	}
+
+	devices, targetID, candidates, errs := validateRetuneRequest(req)
+	if len(errs) > 0 {
+		writeErrors(c, http.StatusBadRequest, errs...)
+		return
+	}
+
+	trials := rules.AdjudicateRetunes(devices, targetID, candidates)
+	results := make([]retuneResultJSON, 0, len(trials))
+	for _, t := range trials {
+		entry := retuneResultJSON{CenterKHz: t.CenterKHz, Accepted: t.Verdict.Accepted}
+		if !t.Verdict.Accepted {
+			outOfBand := toDeviceIntervalsJSON(t.Verdict.OutOfBand)
+			conflicts := toConflictsJSON(t.Verdict.Conflicts)
+			entry.OutOfBand = &outOfBand
+			entry.Conflicts = &conflicts
+		}
+		results = append(results, entry)
+	}
+	c.JSON(http.StatusOK, gin.H{"results": results})
+}
+
+// validateRetuneRequest checks the retune request shape — frequency unit,
+// target selector, fleet and candidate list — collecting one error per
+// problem, in the same style and order as validateRequest.
+func validateRetuneRequest(req checkRetunesRequest) ([]rules.Device, string, []int64, []fieldError) {
+	var errs []fieldError
+
+	inMHz, unitOK := parseFrequencyUnit(req.FrequencyUnit)
+	if !unitOK {
+		errs = append(errs, fieldError{
+			Field:   "frequency_unit",
+			Message: fmt.Sprintf(`must be omitted or %q, got %s`, FrequencyUnitMHz, string(req.FrequencyUnit)),
+		})
+	}
+
+	targetID, targetOK := parseTargetID(req.TargetID)
+	if !targetOK {
+		errs = append(errs, targetIDProblem(req.TargetID))
+	} else if targetID == "" {
+		targetOK = false
+		errs = append(errs, fieldError{Field: "target_id", Message: "must not be empty"})
+	}
+
+	devices, devErrs := validateDevices(req.Devices, inMHz && unitOK)
+	errs = append(errs, devErrs...)
+
+	candidates, candErrs := validateCandidates(req.CandidateCentersKHz, inMHz && unitOK)
+	errs = append(errs, candErrs...)
+
+	// The target must name one of the submitted devices; the raw inputs are
+	// consulted so the check still runs when other device fields are invalid.
+	if targetOK {
+		found := false
+		for _, in := range req.Devices {
+			if in.ID == targetID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			errs = append(errs, fieldError{
+				Field:   "target_id",
+				Message: fmt.Sprintf("no device has id %q", targetID),
+			})
+		}
+	}
+	return devices, targetID, candidates, errs
+}
+
+// parseTargetID reads the required target_id selector. It must be a JSON
+// string; absent, null and non-string values are reported against the field.
+func parseTargetID(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+func targetIDProblem(raw json.RawMessage) fieldError {
+	if len(raw) == 0 {
+		return fieldError{Field: "target_id", Message: "is required"}
+	}
+	return fieldError{Field: "target_id", Message: fmt.Sprintf("must be a string, got %s", string(raw))}
+}
+
+// validateCandidates checks the candidate list size and converts every
+// candidate to integer kHz exactly like a device center_khz. Candidates that
+// normalize to the same kHz value are ambiguous — the trial would run twice
+// on identical input — and are rejected against the later occurrence.
+func validateCandidates(inputs []json.Number, mhzMode bool) ([]int64, []fieldError) {
+	var errs []fieldError
+
+	switch {
+	case inputs == nil:
+		return nil, []fieldError{{Field: "candidate_centers_khz", Message: "is required"}}
+	case len(inputs) < rules.MinCandidates || len(inputs) > rules.MaxCandidates:
+		errs = append(errs, fieldError{
+			Field:   "candidate_centers_khz",
+			Message: fmt.Sprintf("must contain between %d and %d candidates, got %d", rules.MinCandidates, rules.MaxCandidates, len(inputs)),
+		})
+	}
+
+	centers := make([]int64, 0, len(inputs))
+	seen := make(map[int64]int, len(inputs))
+	for i, n := range inputs {
+		field := fmt.Sprintf("candidate_centers_khz[%d]", i)
+		center, ok := parseFrequency(n, mhzMode)
+		if !ok {
+			errs = append(errs, fieldError{Field: field, Message: frequencyProblem(n, mhzMode)})
+			continue
+		}
+		if prev, dup := seen[center]; dup {
+			errs = append(errs, fieldError{
+				Field:   field,
+				Message: fmt.Sprintf("duplicates candidate_centers_khz[%d]: both normalize to %d kHz", prev, center),
+			})
+			continue
+		}
+		seen[center] = i
+		centers = append(centers, center)
+	}
+	return centers, errs
+}
+
 // validateRequest checks the fleet and every device field, collecting one
 // error per problem so the coordinator can fix everything in one pass.
 func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError) {
@@ -174,20 +346,30 @@ func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError)
 		})
 	}
 
+	devices, devErrs := validateDevices(req.Devices, inMHz && unitOK)
+	errs = append(errs, devErrs...)
+	return devices, includeClearance, errs
+}
+
+// validateDevices checks the fleet size and every device field, collecting
+// one error per problem so the coordinator can fix everything in one pass.
+// mhzMode reports whether center_khz / bandwidth_khz carry MHz numbers.
+func validateDevices(inputs []deviceInput, mhzMode bool) ([]rules.Device, []fieldError) {
+	var errs []fieldError
+
 	switch {
-	case req.Devices == nil:
-		errs = append(errs, fieldError{Field: "devices", Message: "is required"})
-		return nil, includeClearance, errs
-	case len(req.Devices) < rules.MinDevices || len(req.Devices) > rules.MaxDevices:
+	case inputs == nil:
+		return nil, []fieldError{{Field: "devices", Message: "is required"}}
+	case len(inputs) < rules.MinDevices || len(inputs) > rules.MaxDevices:
 		errs = append(errs, fieldError{
 			Field:   "devices",
-			Message: fmt.Sprintf("must contain between %d and %d devices, got %d", rules.MinDevices, rules.MaxDevices, len(req.Devices)),
+			Message: fmt.Sprintf("must contain between %d and %d devices, got %d", rules.MinDevices, rules.MaxDevices, len(inputs)),
 		})
 	}
 
-	devices := make([]rules.Device, 0, len(req.Devices))
-	seen := make(map[string]int, len(req.Devices))
-	for i, in := range req.Devices {
+	devices := make([]rules.Device, 0, len(inputs))
+	seen := make(map[string]int, len(inputs))
+	for i, in := range inputs {
 		prefix := fmt.Sprintf("devices[%d]", i)
 
 		if in.ID == "" {
@@ -208,17 +390,17 @@ func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError)
 			})
 		}
 
-		center, centerOK := parseFrequency(in.CenterKHz, inMHz && unitOK)
+		center, centerOK := parseFrequency(in.CenterKHz, mhzMode)
 		if !centerOK {
-			errs = append(errs, fieldError{Field: prefix + ".center_khz", Message: frequencyProblem(in.CenterKHz, inMHz && unitOK)})
+			errs = append(errs, fieldError{Field: prefix + ".center_khz", Message: frequencyProblem(in.CenterKHz, mhzMode)})
 		}
 
 		// The bandwidth range check is unchanged across units: the MHz value
 		// is converted to integer kHz first, then the existing 25..400 kHz
 		// range applies, with no unit-specific branch.
-		bw, bwOK := parseFrequency(in.BandwidthKHz, inMHz && unitOK)
+		bw, bwOK := parseFrequency(in.BandwidthKHz, mhzMode)
 		if !bwOK {
-			errs = append(errs, fieldError{Field: prefix + ".bandwidth_khz", Message: frequencyProblem(in.BandwidthKHz, inMHz && unitOK)})
+			errs = append(errs, fieldError{Field: prefix + ".bandwidth_khz", Message: frequencyProblem(in.BandwidthKHz, mhzMode)})
 		} else if bw < rules.MinBandwidthKHz || bw > rules.MaxBandwidthKHz {
 			errs = append(errs, fieldError{
 				Field:   prefix + ".bandwidth_khz",
@@ -233,7 +415,7 @@ func validateRequest(req coordinateRequest) ([]rules.Device, bool, []fieldError)
 			BandwidthKHz: bw,
 		})
 	}
-	return devices, includeClearance, errs
+	return devices, errs
 }
 
 // parseFrequencyUnit reads the optional frequency_unit selector. Absent means

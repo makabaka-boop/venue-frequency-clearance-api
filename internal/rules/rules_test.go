@@ -435,8 +435,93 @@ func TestComputeClearanceTiesBreakByLimiterID(t *testing.T) {
 	}
 }
 
-// Intervals derived from int64-extreme centers saturate instead of wrapping:
-// margins stay well-ordered and never flip sign.
+// Candidates submitted out of order come back sorted by center frequency,
+// and the one candidate that moves the target clear of its neighbor is the
+// only accepted trial. The fleet itself is not mutated.
+func TestAdjudicateRetunesSortedAndResolvesConflict(t *testing.T) {
+	fleet := []Device{
+		{ID: "other", Purpose: PurposeHandheld, CenterKHz: 500450, BandwidthKHz: 200},  // [500225, 500675]
+		{ID: "target", Purpose: PurposeHandheld, CenterKHz: 500000, BandwidthKHz: 200}, // [499775, 500225]
+	}
+	// 499000 -> [498775, 499225]: clear of other. 500000 touches, 500450
+	// coincides with other.
+	got := AdjudicateRetunes(fleet, "target", []int64{500450, 499000, 500000})
+	if len(got) != 3 {
+		t.Fatalf("got %d results; want 3", len(got))
+	}
+	wantCenters := []int64{499000, 500000, 500450}
+	wantAccepted := []bool{true, false, false}
+	for i := range wantCenters {
+		if got[i].CenterKHz != wantCenters[i] || got[i].Verdict.Accepted != wantAccepted[i] {
+			t.Errorf("result[%d] = (%d, accepted %v); want (%d, accepted %v)",
+				i, got[i].CenterKHz, got[i].Verdict.Accepted, wantCenters[i], wantAccepted[i])
+		}
+	}
+	// The rejected trials name the target<->other conflict, normalized.
+	want := []ConflictPair{{First: "other", Second: "target"}}
+	for _, i := range []int{1, 2} {
+		if !reflect.DeepEqual(got[i].Verdict.Conflicts, want) {
+			t.Errorf("result[%d] conflicts = %+v; want %+v", i, got[i].Verdict.Conflicts, want)
+		}
+	}
+	if fleet[0].CenterKHz != 500450 || fleet[1].CenterKHz != 500000 {
+		t.Errorf("fleet mutated by the trials: %+v", fleet)
+	}
+}
+
+// A conflict the target is not part of cannot be retuned away: every
+// candidate is rejected and names the unrelated pair.
+func TestAdjudicateRetunesUnrelatedConflictStillBlocks(t *testing.T) {
+	fleet := []Device{
+		{ID: "a", Purpose: PurposeHandheld, CenterKHz: 600000, BandwidthKHz: 200},      // [599775, 600225]
+		{ID: "b", Purpose: PurposeHandheld, CenterKHz: 600100, BandwidthKHz: 200},      // [599875, 600325]
+		{ID: "target", Purpose: PurposeHandheld, CenterKHz: 500000, BandwidthKHz: 200}, // [499775, 500225]
+	}
+	got := AdjudicateRetunes(fleet, "target", []int64{501000, 500000})
+	want := []ConflictPair{{First: "a", Second: "b"}}
+	for _, r := range got {
+		if r.Verdict.Accepted {
+			t.Errorf("candidate %d accepted; want rejected by the unrelated a<->b conflict", r.CenterKHz)
+		}
+		if !reflect.DeepEqual(r.Verdict.Conflicts, want) {
+			t.Errorf("candidate %d conflicts = %+v; want %+v", r.CenterKHz, r.Verdict.Conflicts, want)
+		}
+	}
+}
+
+// A legal candidate that pushes the target's protected interval out of the
+// band is a trial verdict, reported with the out-of-band interval.
+func TestAdjudicateRetunesOutOfBandCandidate(t *testing.T) {
+	fleet := []Device{
+		{ID: "target", Purpose: PurposeHandheld, CenterKHz: 500000, BandwidthKHz: 200},
+	}
+	got := AdjudicateRetunes(fleet, "target", []int64{470000})
+	if len(got) != 1 || got[0].Verdict.Accepted {
+		t.Fatalf("got %+v; want one rejected trial", got)
+	}
+	want := []DeviceInterval{{ID: "target", Interval: Interval{LowKHz: 469775, HighKHz: 470225}}}
+	if !reflect.DeepEqual(got[0].Verdict.OutOfBand, want) {
+		t.Errorf("OutOfBand = %+v; want %+v", got[0].Verdict.OutOfBand, want)
+	}
+}
+
+// Only the target's center is retuned; purpose, bandwidth and every other
+// device stay untouched, so a candidate equal to the current center reproduces
+// the plain adjudication verdict.
+func TestAdjudicateRetunesCurrentCenterReproducesVerdict(t *testing.T) {
+	fleet := []Device{
+		{ID: "mic-b", Purpose: PurposeIFB, CenterKHz: 600000, BandwidthKHz: 201},
+		{ID: "mic-a", Purpose: PurposeHandheld, CenterKHz: 500000, BandwidthKHz: 200},
+	}
+	got := AdjudicateRetunes(fleet, "mic-a", []int64{500000})
+	if len(got) != 1 {
+		t.Fatalf("got %d results; want 1", len(got))
+	}
+	if !reflect.DeepEqual(got[0].Verdict, Adjudicate(fleet)) {
+		t.Errorf("trial verdict = %+v; want the plain adjudication %+v", got[0].Verdict, Adjudicate(fleet))
+	}
+}
+
 func TestComputeClearanceExtremeIntervalsSaturate(t *testing.T) {
 	intervals := []DeviceInterval{
 		{ID: "extreme-lo", Interval: Interval{LowKHz: math.MinInt64, HighKHz: math.MinInt64 + 225}},

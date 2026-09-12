@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -50,6 +51,11 @@ func main() {
 		{"mhz: illegal precision and range are locatable 400s", checkMHzValidationErrors},
 		{"frequency_unit unknown or duplicated is rejected before adjudication", checkFrequencyUnitErrors},
 		{"no frequency_unit: legacy success and rejection bytes unchanged", checkLegacyBytesUnchanged},
+		{"retunes: shuffled candidates, one resolves the target conflict", checkRetunesResolves},
+		{"retunes: unrelated conflict still blocks every candidate", checkRetunesUnrelatedConflict},
+		{"retunes: out-of-band candidate is a trial verdict, not a 400", checkRetunesOutOfBandCandidate},
+		{"retunes: MHz candidates match kHz trials byte-for-byte", checkRetunesMHzMatchesKHz},
+		{"retunes: bad target, empty/duplicate/imprecise candidates are locatable 400s", checkRetunesValidationErrors},
 	}
 
 	failures := 0
@@ -960,6 +966,214 @@ func checkLegacyBytesUnchanged(base string) error {
 	return nil
 }
 
+// --- retune trials ---
+
+// retunesResp is the wire form of a check-retunes response.
+type retunesResp struct {
+	Results []struct {
+		CenterKHz int64            `json:"center_khz"`
+		Accepted  bool             `json:"accepted"`
+		OutOfBand []deviceInterval `json:"out_of_band"`
+		Conflicts []conflictPair   `json:"conflicts"`
+	} `json:"results"`
+}
+
+func checkRetunesResolves(base string) error {
+	// other protects [500225, 500675]; the target currently touches it at
+	// 500225. Candidate 499000 moves the target to [498775, 499225]: the only
+	// accepted trial. Candidates are submitted out of order; the response is
+	// sorted by center frequency and byte-stable.
+	body := `{"devices":[
+		{"id":"other","purpose":"handheld","center_khz":500450,"bandwidth_khz":200},
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[500450,499000,500000]}`
+	status, raw, err := postRetunes(base, body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status = %d, body = %s", status, raw)
+	}
+	want := `{"results":[` +
+		`{"center_khz":499000,"accepted":true},` +
+		`{"center_khz":500000,"accepted":false,"out_of_band":[],"conflicts":[{"first":"other","second":"target"}]},` +
+		`{"center_khz":500450,"accepted":false,"out_of_band":[],"conflicts":[{"first":"other","second":"target"}]}` +
+		`]}`
+	if !bytes.Equal(raw, []byte(want)) {
+		return fmt.Errorf("body = %s, want %s", raw, want)
+	}
+
+	// The same candidates in a different order, and the same fleet listed in
+	// a different order, must produce byte-identical responses.
+	shuffled := `{"devices":[
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+		{"id":"other","purpose":"handheld","center_khz":500450,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[500000,500450,499000]}`
+	_, reordered, err := postRetunes(base, shuffled)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(raw, reordered) {
+		return fmt.Errorf("reordered candidates differ:\n%s\n%s", raw, reordered)
+	}
+	return nil
+}
+
+func checkRetunesUnrelatedConflict(base string) error {
+	// a and b conflict with each other around 600 MHz; retuning the target
+	// cannot fix that, so every candidate is rejected naming the a<->b pair.
+	body := `{"devices":[
+		{"id":"b","purpose":"handheld","center_khz":600100,"bandwidth_khz":200},
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200},
+		{"id":"a","purpose":"handheld","center_khz":600000,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[501000,500000]}`
+	status, raw, err := postRetunes(base, body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status = %d, body = %s", status, raw)
+	}
+	want := `{"results":[` +
+		`{"center_khz":500000,"accepted":false,"out_of_band":[],"conflicts":[{"first":"a","second":"b"}]},` +
+		`{"center_khz":501000,"accepted":false,"out_of_band":[],"conflicts":[{"first":"a","second":"b"}]}` +
+		`]}`
+	if !bytes.Equal(raw, []byte(want)) {
+		return fmt.Errorf("body = %s, want %s", raw, want)
+	}
+	return nil
+}
+
+func checkRetunesOutOfBandCandidate(base string) error {
+	// Candidate 470000 is a legal kHz number, but the target's protected
+	// interval [469775, 470225] leaves the band: a trial verdict (200 with
+	// accepted=false and the out-of-band detail), not a request error.
+	body := `{"devices":[
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[470000,500000]}`
+	status, raw, err := postRetunes(base, body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status = %d, want 200, body = %s", status, raw)
+	}
+	want := `{"results":[` +
+		`{"center_khz":470000,"accepted":false,"out_of_band":[{"id":"target","low_khz":469775,"high_khz":470225}],"conflicts":[]},` +
+		`{"center_khz":500000,"accepted":true}` +
+		`]}`
+	if !bytes.Equal(raw, []byte(want)) {
+		return fmt.Errorf("body = %s, want %s", raw, want)
+	}
+	return nil
+}
+
+func checkRetunesMHzMatchesKHz(base string) error {
+	// MHz candidates and device numbers are converted to integer kHz before
+	// the trials run: the response is byte-identical to the kHz request.
+	mhzBody := `{"frequency_unit":"mhz","devices":[
+		{"id":"other","purpose":"handheld","center_khz":500.450,"bandwidth_khz":0.200},
+		{"id":"target","purpose":"handheld","center_khz":500.000,"bandwidth_khz":0.200}
+	],"target_id":"target","candidate_centers_khz":[500.450,499.000,500.000]}`
+	status, mhzRaw, err := postRetunes(base, mhzBody)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("mhz: status = %d, body = %s", status, mhzRaw)
+	}
+	khzBody := `{"devices":[
+		{"id":"other","purpose":"handheld","center_khz":500450,"bandwidth_khz":200},
+		{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+	],"target_id":"target","candidate_centers_khz":[500450,499000,500000]}`
+	status, khzRaw, err := postRetunes(base, khzBody)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("khz: status = %d, body = %s", status, khzRaw)
+	}
+	if !bytes.Equal(mhzRaw, khzRaw) {
+		return fmt.Errorf("MHz and kHz trial responses differ:\n%s\n%s", mhzRaw, khzRaw)
+	}
+	return nil
+}
+
+func checkRetunesValidationErrors(base string) error {
+	fleet := `[{"id":"target","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}]`
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"missing target_id", `{"devices":` + fleet + `,"candidate_centers_khz":[500000]}`, "target_id"},
+		{"null target_id", `{"devices":` + fleet + `,"target_id":null,"candidate_centers_khz":[500000]}`, "target_id"},
+		{"empty target_id", `{"devices":` + fleet + `,"target_id":"","candidate_centers_khz":[500000]}`, "target_id"},
+		{"unknown target_id", `{"devices":` + fleet + `,"target_id":"ghost","candidate_centers_khz":[500000]}`, "target_id"},
+		{"missing candidates", `{"devices":` + fleet + `,"target_id":"target"}`, "candidate_centers_khz"},
+		{"empty candidates", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[]}`, "candidate_centers_khz"},
+		{"fractional kHz candidate", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[500000.5]}`, "candidate_centers_khz[0]"},
+		{"candidate beyond int64", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[99999999999999999999999]}`, "candidate_centers_khz[0]"},
+		{"duplicate candidates", `{"devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[499000,500000,499000]}`, "candidate_centers_khz[2]"},
+		{"mhz candidate with four decimals", `{"frequency_unit":"mhz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[500.0001]}`, "candidate_centers_khz[0]"},
+		{"mhz candidate beyond int64 kHz", `{"frequency_unit":"mhz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[9223372036854775.808]}`, "candidate_centers_khz[0]"},
+		{"mhz candidates normalize to the same kHz", `{"frequency_unit":"mhz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[500,500.000]}`, "candidate_centers_khz[1]"},
+		{"unknown frequency_unit", `{"frequency_unit":"khz","devices":` + fleet + `,"target_id":"target","candidate_centers_khz":[500000]}`, "frequency_unit"},
+	}
+	for _, tc := range cases {
+		status, raw, err := postRetunes(base, tc.body)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusBadRequest {
+			return fmt.Errorf("%s: status = %d, want 400, body = %s", tc.name, status, raw)
+		}
+		var e errorResp
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return fmt.Errorf("%s: %w, body = %s", tc.name, err, raw)
+		}
+		if e.Accepted {
+			return fmt.Errorf("%s: accepted = true, want false, body = %s", tc.name, raw)
+		}
+		found := false
+		for _, fe := range e.Errors {
+			if fe.Field == tc.field {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s: no error locating %q, body = %s", tc.name, tc.field, raw)
+		}
+	}
+
+	// 51 candidates exceed the per-request limit of 50.
+	many := make([]string, 0, 51)
+	for i := 0; i < 51; i++ {
+		many = append(many, fmt.Sprintf("%d", 470137+i*1120))
+	}
+	status, raw, err := postRetunes(base, `{"devices":`+fleet+`,"target_id":"target","candidate_centers_khz":[`+strings.Join(many, ",")+`]}`)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusBadRequest {
+		return fmt.Errorf("51 candidates: status = %d, want 400, body = %s", status, raw)
+	}
+	var e errorResp
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return err
+	}
+	found := false
+	for _, fe := range e.Errors {
+		if fe.Field == "candidate_centers_khz" {
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("51 candidates: no error locating candidate_centers_khz, body = %s", raw)
+	}
+	return nil
+}
+
 // --- helpers ---
 
 func checkDuplicateKeys(base string) error {
@@ -1018,6 +1232,19 @@ func checkDuplicateKeys(base string) error {
 
 func postRaw(base, body string) (int, []byte, error) {
 	resp, err := http.Post(base+"/v1/coordinate", "application/json", bytes.NewReader([]byte(body)))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, data, nil
+}
+
+func postRetunes(base, body string) (int, []byte, error) {
+	resp, err := http.Post(base+"/v1/check-retunes", "application/json", bytes.NewReader([]byte(body)))
 	if err != nil {
 		return 0, nil, err
 	}

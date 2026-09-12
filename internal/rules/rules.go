@@ -26,6 +26,12 @@ const (
 	MaxDevices = 200
 )
 
+// Candidate center frequency limits for one retune trial request.
+const (
+	MinCandidates = 1
+	MaxCandidates = 50
+)
+
 // Supported purposes.
 const (
 	PurposeHandheld = "handheld"
@@ -267,6 +273,37 @@ func Adjudicate(devices []Device) Verdict {
 		OutOfBand: outOfBand,
 		Conflicts: conflicts,
 	}
+}
+
+// RetuneVerdict is the trial verdict for one candidate center frequency: the
+// fleet adjudicated with the target device retuned to CenterKHz.
+type RetuneVerdict struct {
+	CenterKHz int64
+	Verdict   Verdict
+}
+
+// AdjudicateRetunes tries each candidate center frequency for one target
+// device: the candidate replaces the target's center, every other device and
+// the target's purpose and bandwidth stay untouched, and the modified fleet
+// is adjudicated exactly as a submitted one. The input slices are not
+// modified.
+//
+// Results are sorted by candidate center frequency ascending, so the report
+// is stable no matter what order the candidates were submitted in.
+func AdjudicateRetunes(devices []Device, targetID string, candidates []int64) []RetuneVerdict {
+	results := make([]RetuneVerdict, 0, len(candidates))
+	for _, center := range candidates {
+		trial := make([]Device, len(devices))
+		copy(trial, devices)
+		for i := range trial {
+			if trial[i].ID == targetID {
+				trial[i].CenterKHz = center
+			}
+		}
+		results = append(results, RetuneVerdict{CenterKHz: center, Verdict: Adjudicate(trial)})
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].CenterKHz < results[j].CenterKHz })
+	return results
 }
 
 // findConflicts returns every conflicting pair over the given device
