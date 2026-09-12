@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    image: wireless-coordinator
+    command: ["server"]
+    environment:
+      PORT: "8080"
+    ports:
+      # Host port is overridable: API_PORT=9000 docker compose up api
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+
+  # One-shot acceptance service: waits for the API, runs the end-to-end
+  # checks, prints PASS/FAIL per check and exits non-zero on any failure.
+  verify:
+    build: .
+    image: wireless-coordinator
+    command: ["verify"]
+    environment:
+      API_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
