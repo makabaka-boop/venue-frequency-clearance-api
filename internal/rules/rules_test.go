@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"math"
 	"reflect"
 	"testing"
 )
@@ -57,6 +58,61 @@ func TestProtectedIntervalUnknownPurpose(t *testing.T) {
 	d := Device{ID: "mic", Purpose: "lavalier", CenterKHz: 500000, BandwidthKHz: 200}
 	if _, ok := ProtectedInterval(d); ok {
 		t.Errorf("ProtectedInterval(%+v) ok = true; want false", d)
+	}
+}
+
+// Regression: extreme center frequencies must saturate instead of wrapping
+// around into an inverted, seemingly in-band interval.
+func TestProtectedIntervalExtremeCenterSaturates(t *testing.T) {
+	cases := []struct {
+		name    string
+		center  int64
+		wantLow int64
+		wantHi  int64
+	}{
+		// handheld, bw 200: half widths 100/100, guard 125 -> offsets of 225.
+		{"max int64", math.MaxInt64, math.MaxInt64 - 225, math.MaxInt64},
+		{"min int64", math.MinInt64, math.MinInt64, math.MinInt64 + 225},
+		{"largest center that still fits", math.MaxInt64 - 225, math.MaxInt64 - 450, math.MaxInt64},
+		{"smallest center that still fits", math.MinInt64 + 225, math.MinInt64, math.MinInt64 + 450},
+	}
+	for _, tc := range cases {
+		d := Device{ID: "x", Purpose: PurposeHandheld, CenterKHz: tc.center, BandwidthKHz: 200}
+		iv, ok := ProtectedInterval(d)
+		if !ok {
+			t.Fatalf("%s: ok = false; want true", tc.name)
+		}
+		if iv.LowKHz > iv.HighKHz {
+			t.Errorf("%s: inverted interval [%d, %d]", tc.name, iv.LowKHz, iv.HighKHz)
+		}
+		if iv.LowKHz != tc.wantLow || iv.HighKHz != tc.wantHi {
+			t.Errorf("%s: interval = [%d, %d]; want [%d, %d]", tc.name, iv.LowKHz, iv.HighKHz, tc.wantLow, tc.wantHi)
+		}
+		if InBand(iv) {
+			t.Errorf("%s: InBand(%+v) = true; want false for extreme center", tc.name, iv)
+		}
+	}
+}
+
+func TestAdjudicateExtremeCenterRejected(t *testing.T) {
+	fleet := []Device{
+		{ID: "extreme", Purpose: PurposeHandheld, CenterKHz: math.MaxInt64, BandwidthKHz: 200},
+		{ID: "normal", Purpose: PurposeHandheld, CenterKHz: 500000, BandwidthKHz: 200},
+	}
+	v := Adjudicate(fleet)
+	if v.Accepted {
+		t.Fatalf("Adjudicate(%+v).Accepted = true; want false for extreme center", fleet)
+	}
+	if len(v.OutOfBand) != 1 || v.OutOfBand[0].ID != "extreme" {
+		t.Fatalf("OutOfBand = %+v; want single entry for %q", v.OutOfBand, "extreme")
+	}
+	iv := v.OutOfBand[0].Interval
+	if iv.LowKHz > iv.HighKHz {
+		t.Errorf("inverted interval [%d, %d] for extreme center", iv.LowKHz, iv.HighKHz)
+	}
+	// The saturated interval must not wrap around and collide with others.
+	if len(v.Conflicts) != 0 {
+		t.Errorf("Conflicts = %+v; want empty", v.Conflicts)
 	}
 }
 

@@ -3,7 +3,10 @@
 // domain package: no HTTP, no JSON, no I/O.
 package rules
 
-import "sort"
+import (
+	"math"
+	"sort"
+)
 
 // Allowed band, closed interval, in kHz.
 const (
@@ -61,17 +64,43 @@ type Interval struct {
 // ProtectedInterval computes the protected interval of a device: the
 // occupied interval [center-floor(bw/2), center+ceil(bw/2)] extended by the
 // purpose guard interval on both sides. ok is false for an unknown purpose.
+//
+// Arithmetic saturates at the int64 limits, so an extreme center frequency
+// yields a huge but well-ordered interval that InBand rejects, instead of
+// wrapping around into an inverted, seemingly in-band one.
 func ProtectedInterval(d Device) (Interval, bool) {
 	guard, ok := GuardKHz(d.Purpose)
 	if !ok {
 		return Interval{}, false
 	}
 	halfFloor := d.BandwidthKHz / 2
-	halfCeil := (d.BandwidthKHz + 1) / 2
+	halfCeil := d.BandwidthKHz/2 + d.BandwidthKHz%2 // ceil(bw/2) that cannot overflow
 	return Interval{
-		LowKHz:  d.CenterKHz - halfFloor - guard,
-		HighKHz: d.CenterKHz + halfCeil + guard,
+		LowKHz:  subSat(subSat(d.CenterKHz, halfFloor), guard),
+		HighKHz: addSat(addSat(d.CenterKHz, halfCeil), guard),
 	}, true
+}
+
+// addSat returns a + b, saturating to the int64 limits on overflow.
+func addSat(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
+}
+
+// subSat returns a - b, saturating to the int64 limits on overflow.
+func subSat(a, b int64) int64 {
+	if b < 0 && a > math.MaxInt64+b {
+		return math.MaxInt64
+	}
+	if b > 0 && a < math.MinInt64+b {
+		return math.MinInt64
+	}
+	return a - b
 }
 
 // InBand reports whether the interval lies fully inside the allowed band

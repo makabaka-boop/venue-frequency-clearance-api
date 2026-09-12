@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"reflect"
@@ -34,6 +35,7 @@ func main() {
 		{"one kHz apart is accepted", checkOneKHzApart},
 		{"multiple conflicts sorted and normalized", checkMultipleConflicts},
 		{"out-of-band devices reported with intervals", checkOutOfBand},
+		{"extreme center saturates instead of wrapping", checkExtremeCenter},
 		{"validation errors locate fields", checkValidationErrors},
 		{"fleet size limits", checkFleetSizeLimits},
 		{"verdict is stable across repeats", checkStable},
@@ -257,6 +259,40 @@ func checkOutOfBand(base string) error {
 	want := []deviceInterval{
 		{ID: "z-hi", LowKHz: 693675, HighKHz: 694125},
 		{ID: "z-lo", LowKHz: 469900, HighKHz: 470500},
+	}
+	if !reflect.DeepEqual(v.OutOfBand, want) {
+		return fmt.Errorf("out_of_band = %+v, want %+v", v.OutOfBand, want)
+	}
+	if len(v.Conflicts) != 0 {
+		return fmt.Errorf("conflicts = %+v, want empty", v.Conflicts)
+	}
+	return nil
+}
+
+func checkExtremeCenter(base string) error {
+	// int64-extreme centers must saturate, not wrap around into inverted,
+	// seemingly in-band intervals. Both devices are out of band.
+	status, raw, err := post(base, map[string]any{"devices": []deviceReq{
+		{ID: "extreme-lo", Purpose: "handheld", CenterKHz: math.MinInt64, BandwidthKHz: 200},
+		{ID: "extreme-hi", Purpose: "handheld", CenterKHz: math.MaxInt64, BandwidthKHz: 200},
+		{ID: "normal", Purpose: "handheld", CenterKHz: 500000, BandwidthKHz: 200},
+	}})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("status = %d, body = %s", status, raw)
+	}
+	var v verdictResp
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return err
+	}
+	if v.Accepted {
+		return fmt.Errorf("accepted = true, want false, body = %s", raw)
+	}
+	want := []deviceInterval{
+		{ID: "extreme-hi", LowKHz: math.MaxInt64 - 225, HighKHz: math.MaxInt64},
+		{ID: "extreme-lo", LowKHz: math.MinInt64, HighKHz: math.MinInt64 + 225},
 	}
 	if !reflect.DeepEqual(v.OutOfBand, want) {
 		return fmt.Errorf("out_of_band = %+v, want %+v", v.OutOfBand, want)

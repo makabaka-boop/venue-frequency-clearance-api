@@ -14,17 +14,23 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-func postBody(t *testing.T, body string) (int, map[string]any) {
+func postBodyRaw(t *testing.T, body string) (int, []byte) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/coordinate", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	NewRouter().ServeHTTP(rec, req)
+	return rec.Code, rec.Body.Bytes()
+}
+
+func postBody(t *testing.T, body string) (int, map[string]any) {
+	t.Helper()
+	status, raw := postBodyRaw(t, body)
 	var decoded map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
-		t.Fatalf("response is not JSON: %v\nbody: %s", err, rec.Body.String())
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("response is not JSON: %v\nbody: %s", err, raw)
 	}
-	return rec.Code, decoded
+	return status, decoded
 }
 
 func TestCoordinateAccepted(t *testing.T) {
@@ -156,5 +162,62 @@ func TestCoordinateMalformedJSON(t *testing.T) {
 	}
 	if resp["accepted"] != false {
 		t.Errorf("accepted = %v; want false", resp["accepted"])
+	}
+}
+
+// Regression: an int64-extreme center frequency must be rejected as out of
+// band with a well-ordered interval, not wrapped around and accepted.
+func TestCoordinateExtremeCenterFrequency(t *testing.T) {
+	body := `{"devices":[
+		{"id":"extreme","purpose":"handheld","center_khz":9223372036854775807,"bandwidth_khz":200},
+		{"id":"normal","purpose":"handheld","center_khz":500000,"bandwidth_khz":200}
+	]}`
+	status, raw := postBodyRaw(t, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d; want 200, body = %s", status, raw)
+	}
+	// Typed decode: the extreme endpoints exceed float64 precision.
+	var resp struct {
+		Accepted  bool `json:"accepted"`
+		OutOfBand []struct {
+			ID      string `json:"id"`
+			LowKHz  int64  `json:"low_khz"`
+			HighKHz int64  `json:"high_khz"`
+		} `json:"out_of_band"`
+		Conflicts []any `json:"conflicts"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Accepted {
+		t.Fatalf("accepted = true; want false, body = %s", raw)
+	}
+	if len(resp.OutOfBand) != 1 || resp.OutOfBand[0].ID != "extreme" {
+		t.Fatalf("out_of_band = %+v; want single entry for %q", resp.OutOfBand, "extreme")
+	}
+	iv := resp.OutOfBand[0]
+	if iv.LowKHz > iv.HighKHz {
+		t.Errorf("inverted interval [%d, %d]", iv.LowKHz, iv.HighKHz)
+	}
+	if iv.LowKHz != 9223372036854775582 || iv.HighKHz != 9223372036854775807 {
+		t.Errorf("interval = [%d, %d]; want [9223372036854775582, 9223372036854775807]", iv.LowKHz, iv.HighKHz)
+	}
+	if len(resp.Conflicts) != 0 {
+		t.Errorf("conflicts = %v; want empty", resp.Conflicts)
+	}
+}
+
+func TestCoordinateCenterBeyondInt64(t *testing.T) {
+	body := `{"devices":[{"id":"x","purpose":"handheld","center_khz":99999999999999999999999,"bandwidth_khz":200}]}`
+	status, resp := postBody(t, body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d; want 400, resp = %v", status, resp)
+	}
+	errs, ok := resp["errors"].([]any)
+	if !ok || len(errs) == 0 {
+		t.Fatalf("errors = %v; want a non-empty list", resp["errors"])
+	}
+	if errs[0].(map[string]any)["field"] != "devices[0].center_khz" {
+		t.Errorf("error field = %v; want devices[0].center_khz", errs[0])
 	}
 }
